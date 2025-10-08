@@ -251,20 +251,32 @@ def offline_summary_fallback(title, text, url):
 
 # ---------------- Logo generator ----------------
 def generate_logo_bytes(text="DailyCAThroughAI", size=(420,80), bgcolor=(31,78,121), fg=(255,255,255)):
-    """Create a simple rectangular logo PNG bytes using PIL."""
+    """Create a simple rectangular logo PNG bytes using PIL (compatible with Pillow ≥10)."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except Exception:
         return None
+
     img = Image.new("RGB", size, bgcolor)
     draw = ImageDraw.Draw(img)
-    # try to load a sans font; fallback to default
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
     except Exception:
         font = ImageFont.load_default()
-    w,h = draw.textsize(text, font=font)
-    draw.text(((size[0]-w)/2, (size[1]-h)/2), text, font=font, fill=fg)
+
+    # Pillow ≥10 fix: use textbbox() instead of textsize()
+    try:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+    except Exception:
+        # fallback for very old versions
+        text_width, text_height = draw.textlength(text, font=font), 28
+
+    x = (size[0] - text_width) / 2
+    y = (size[1] - text_height) / 2
+    draw.text((x, y), text, font=font, fill=fg)
+
     bio = io.BytesIO()
     img.save(bio, format="PNG")
     bio.seek(0)
