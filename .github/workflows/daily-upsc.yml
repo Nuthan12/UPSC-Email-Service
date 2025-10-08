@@ -1,29 +1,31 @@
 name: Send Daily UPSC AI Brief
+
 on:
   schedule:
-    - cron: "0 3 * * *"   # 03:00 UTC = 08:30 AM IST daily
-  workflow_dispatch:
+    # Runs every day at 03:00 UTC (08:30 AM IST)
+    - cron: "0 3 * * *"
+  workflow_dispatch:  # allows manual trigger
 
 jobs:
-  run-and-send:
+  run-generator:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout repository
+      - name: 🧭 Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: 📦 Install dependencies
         run: |
-            python -m pip install --upgrade pip
-           pip install feedparser newspaper3k reportlab openai requests pillow readability-lxml
+          python -m pip install --upgrade pip
+          pip install feedparser newspaper3k reportlab openai requests pillow readability-lxml
 
-
-      - name: Generate and Send UPSC Brief
+      - name: ⚙️ Generate and Send UPSC Brief
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SMTP_HOST: smtp.gmail.com
