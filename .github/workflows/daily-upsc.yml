@@ -1,6 +1,7 @@
+name: Send Daily UPSC Brief
 on:
   schedule:
-    - cron: "0 3 * * *"   # runs daily at 8:30 AM IST (03:00 UTC)
+    - cron: "0 3 * * *"   # 8:30 AM IST daily (03:00 UTC)
   workflow_dispatch:
 
 jobs:
