@@ -1,73 +1,90 @@
 #!/usr/bin/env python3
 """
-Generate UPSC PDF and email it.
-This script:
- - Creates UPSC_current_affairs_detailed_YYYY-MM-DD.pdf in the repo workspace
- - Emails it using SMTP credentials provided via environment variables
+email_pdf_service.py
+Generates a template-styled UPSC current-affairs PDF (based on user demo layout)
+and emails it via SMTP. Designed to run inside GitHub Actions.
 
-Required env vars (set as repo Secrets):
+Required repo secrets:
+ - SMTP_USER
+ - SMTP_PASSWORD   (use Gmail App Password if using Gmail)
+ - EMAIL_TO
+Optional:
  - SMTP_HOST (default smtp.gmail.com)
  - SMTP_PORT (default 587)
- - SMTP_USER
- - SMTP_PASSWORD
- - EMAIL_TO
-Optionally:
- - PDF_PATH (overrides generated file path)
-"""
 
-import os, datetime, ssl, smtplib
+Commit this file to the repo root and use the workflow YAML below.
+"""
+import os, datetime, ssl, smtplib, textwrap
 from email.message import EmailMessage
 
-# ---- PDF generation (reportlab) ----
-def generate_pdf(output_path):
+# ---------- PDF generation ----------
+def generate_pdf(path):
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
         from reportlab.lib.units import mm
     except Exception as e:
-        raise RuntimeError("reportlab must be installed. Add 'pip install reportlab' to workflow.") from e
+        raise RuntimeError("reportlab not installed. Ensure 'pip install reportlab' runs in the workflow.") from e
 
-    doc = SimpleDocTemplate(output_path, pagesize=A4,
-                            rightMargin=20*mm, leftMargin=20*mm, topMargin=20*mm, bottomMargin=20*mm)
+    doc = SimpleDocTemplate(path, pagesize=A4,
+                            rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
 
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name='MyTitle', fontSize=16, leading=18, spaceAfter=8, spaceBefore=8))
-    styles.add(ParagraphStyle(name='MyHeading', fontSize=13, leading=15, spaceAfter=6, spaceBefore=10))
-    styles.add(ParagraphStyle(name='MyBody', fontSize=10, leading=13))
+    styles.add(ParagraphStyle(name='TitleLarge', fontSize=16, leading=18, spaceAfter=6, spaceBefore=6))
+    styles.add(ParagraphStyle(name='Section', fontSize=12, leading=14, spaceAfter=4, spaceBefore=8))
+    styles.add(ParagraphStyle(name='Body', fontSize=10, leading=12))
+    styles.add(ParagraphStyle(name='Small', fontSize=9, leading=11))
 
     content = []
-    now = datetime.datetime.now().strftime("%d %B %Y %H:%M:%S")
-    content.append(Paragraph("UPSC Current Affairs — Detailed Brief Insights (" + datetime.datetime.now().strftime("%d %B %Y") + ")", styles['MyTitle']))
-    content.append(Paragraph("Concise but comprehensive insights across all major UPSC subjects. Each item includes a short analysis and exam relevance.", styles['MyBody']))
-    content.append(Spacer(1,8))
-    content.append(Paragraph(f"Compiled on {now}.", styles['MyBody']))
+    today_str = datetime.datetime.now().strftime("%d %B %Y")
+    content.append(Paragraph(f"UPSC CURRENT AFFAIRS – {today_str}", styles['TitleLarge']))
+    content.append(Paragraph("Daily insights | Template-based layout (user demo)", styles['Small']))
     content.append(Spacer(1,8))
 
-    # Example sections: replace / extend with your current content as needed
-    sections = {
-        "Polity & International Relations": "PM Modi spoke with Russian President Vladimir Putin to reaffirm the 'Special and Privileged Strategic Partnership'. They discussed defence and energy cooperation. Significance: India's diplomacy with major powers and energy security.",
-        "Economy & Finance": "RBI defended the rupee near ~₹88.80/USD via market intervention. Traders report some Russian oil payments being settled in yuan, affecting forex patterns.",
-        "Environment & Disaster Management": "A landslide in Himachal Pradesh's Bilaspur district killed several people after heavy rain; highlights disaster readiness and climate-related vulnerabilities.",
-        "Defence & Internal Security": "Ongoing defence cooperation and NSG preparedness exercises; internal security concerns continue in affected regions.",
-        "Ethics, Integrity & Governance": "Debates on misinformation regulation vs free speech; corporate governance issues in trustee disputes raised transparency questions.",
-        "Agriculture & Rural Development": "Flood impacts and MSP changes focus on food security, procurement, and rural relief measures.",
-        "Science & Technology / Space": "ISRO infrastructure updates and public interest events like supermoon; space policy implications remain relevant.",
-        "Culture & Heritage": "INTACH appointments and heritage protection debates; interplay of community rights and conservation.",
-        "Urban Governance & Environment": "Urban greening initiatives and municipal capacity are central to pollution control and governance."
-    }
+    # Template sections derived from the demo you uploaded
+    sections = [
+        ("GS Paper 2", [
+            ("The State of Social Justice 2025",
+             "Context: ILO released 'The State of Social Justice 2025' assessing progress since 1995. Key points: four foundational pillars; progress in poverty reduction; persistent inequalities and recommended policy actions."),
+        ]),
+        ("GS Paper 4", [
+            ("Passive Euthanasia in India",
+             "Context and summary: legal judgments (Aruna Shanbaug 2011, Common Cause 2018), advance directives, medical board oversight, ethical dilemmas and proposed reforms such as digital advance directives and hospital ethics committees."),
+        ]),
+        ("Content for Mains Enrichment (CME)", [
+            ("Indian Diet",
+             "ICMR-INDIAB 2025 shows high carbohydrate share in Indian diets; links to NCDs and policy implications for Poshan 2.0 and public health."),
+        ]),
+        ("Facts for Prelims (FFP)", [
+            ("Nobel Medicine Prize 2025",
+             "Winners and short explanation: Tregs and peripheral immune tolerance — implications for cancer, autoimmunity and transplantation."),
+            ("International Stabilization Force for Gaza",
+             "Short explainer: proposed multinational force model under US oversight; functions and geopolitical implications."),
+        ]),
+        ("Mapping", [
+            ("Port of Pasni",
+             "Short explainer: Pakistan proposes Pasni for mineral export; strategic implications in Arabian Sea and relations with Chabahar/Gwadar."),
+        ])
+    ]
 
-    for title, body in sections.items():
-        content.append(Paragraph(title, styles['MyHeading']))
-        content.append(Paragraph(body, styles['MyBody']))
+    for sec_title, items in sections:
+        content.append(Paragraph(sec_title, styles['Section']))
+        for title, body in items:
+            content.append(Paragraph(f"<b>{title}</b>", styles['Body']))
+            wrapped = textwrap.fill(body, 110)
+            for para in wrapped.split("\n"):
+                content.append(Paragraph(para, styles['Body']))
+            content.append(Spacer(1,6))
         content.append(Spacer(1,8))
 
-    content.append(Paragraph("Sources: Reuters, AP, PMO/PMIndia, ISRO, The Hindu, PIB (check official releases for details).", styles['MyBody']))
-    content.append(Spacer(1,12))
+    content.append(Paragraph("Sources: sample placeholders (InsightsonIndia demo, The Hindu, Reuters, AP, PIB). Replace with live-scraped or curated sources as needed.", styles['Small']))
+    content.append(Spacer(1,6))
+    content.append(Paragraph(f"Prepared automatically — template adapted from user demo. Generated on {today_str}.", styles['Small']))
 
     doc.build(content)
 
-# ---- Email sending ----
+# ---------- Email sending ----------
 def send_email(pdf_path):
     SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
@@ -76,16 +93,16 @@ def send_email(pdf_path):
     EMAIL_TO = os.environ.get("EMAIL_TO")
 
     if not SMTP_USER or not SMTP_PASSWORD or not EMAIL_TO:
-        raise EnvironmentError("Missing SMTP_USER, SMTP_PASSWORD or EMAIL_TO environment variables.")
+        raise EnvironmentError("Missing required environment variables: SMTP_USER, SMTP_PASSWORD, EMAIL_TO")
 
     if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF not found at {pdf_path}")
+        generate_pdf(pdf_path)
 
     msg = EmailMessage()
     msg["From"] = SMTP_USER
     msg["To"] = EMAIL_TO
-    msg["Subject"] = "UPSC Current Affairs — Detailed Brief (" + datetime.datetime.now().strftime("%d %b %Y") + ")"
-    msg.set_content("Please find attached the UPSC current affairs detailed brief.\n\nRegards,\nUPSC Brief Service")
+    msg["Subject"] = "UPSC Current Affairs — Daily Brief (" + datetime.datetime.now().strftime("%d %b %Y") + ")"
+    msg.set_content("Attached: UPSC current affairs brief (template-based).")
 
     with open(pdf_path, "rb") as f:
         data = f.read()
@@ -98,18 +115,12 @@ def send_email(pdf_path):
         server.send_message(msg)
     print("Email sent to", EMAIL_TO)
 
-# ---- Main ----
+# ---------- Main ----------
 if __name__ == "__main__":
-    # Generated filename using today's date
-    default_name = "UPSC_current_affairs_detailed_" + datetime.datetime.now().strftime("%Y-%m-%d") + ".pdf"
-    PDF_PATH = os.environ.get("PDF_PATH", default_name)
-
-    # Generate PDF
-    print("Generating PDF at:", PDF_PATH)
-    generate_pdf(PDF_PATH)
-    print("PDF generated.")
-
-    # Send it
+    name = "UPSC_current_affairs_template_based_" + datetime.datetime.now().strftime("%Y-%m-%d") + ".pdf"
+    path = os.environ.get("PDF_PATH", name)
+    print("Generating PDF at:", path)
+    generate_pdf(path)
     print("Sending email...")
-    send_email(PDF_PATH)
+    send_email(path)
     print("Done.")
