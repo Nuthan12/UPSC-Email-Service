@@ -22,6 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install feedparser newspaper3k reportlab openai requests pillow readability-lxml
 
+
       - name: Generate and Send UPSC Brief
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
