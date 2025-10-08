@@ -1,6 +1,6 @@
 on:
   schedule:
-    - cron: "48 7 * * *"   # runs daily at 1:18 PM IST (07:48 UTC)
+    - cron: "0 3 * * *"   # runs daily at 8:30 AM IST (03:00 UTC)
   workflow_dispatch:
 
 jobs:
