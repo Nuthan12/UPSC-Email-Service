@@ -1,14 +1,15 @@
-name: Send Daily UPSC Brief
+name: Send Daily UPSC AI Brief
 on:
   schedule:
-    - cron: "0 3 * * *"   # 8:30 AM IST daily (03:00 UTC)
+    - cron: "0 3 * * *"   # 03:00 UTC = 08:30 AM IST daily
   workflow_dispatch:
 
 jobs:
-  send-mail:
+  run-and-send:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -17,13 +18,16 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install reportlab
+        run: |
+          python -m pip install --upgrade pip
+          pip install feedparser newspaper3k reportlab openai requests
 
-      - name: Generate & email PDF
+      - name: Generate and Send UPSC Brief
         env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SMTP_HOST: smtp.gmail.com
           SMTP_PORT: 587
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python email_pdf_service.py
+        run: python generate_and_send.py
