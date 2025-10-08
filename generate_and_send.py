@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """
-generate_and_send.py — updated:
-- Adds programmatic logo (DailyCAThroughAI) and nicer PDF layout
-- Article card boxes with borders; article image placed to the right
-- Improved UPSC relevance inference if the model gives generic relevance
-- Groq primary, OpenAI optional fallback, offline fallback guaranteed
+generate_and_send.py
+
+Finalized UPSC Daily Brief generator:
+- Groq primary summarization (GROQ_API_KEY required in secrets)
+- Optional OpenAI fallback (OPENAI_API_KEY)
+- Offline fallback to ensure a PDF is always produced
+- Clean extraction, images embedded safely, logo generation compatible with Pillow >=10
+- Robust PDF layout (boxed cards) with image on the right
 """
 
-import os, re, time, json, ssl, smtplib, io, datetime, requests
+import os
+import re
+import time
+import json
+import ssl
+import smtplib
+import io
+import datetime
+import requests
+
 from email.message import EmailMessage
 from urllib.parse import urlparse
 
@@ -31,23 +43,29 @@ RSS_FEEDS = [
 MAX_CANDIDATES = 25
 MAX_INCLUSIONS = 12
 
-# ---------------- HELPERS ----------------
+# ---------------- UTILITIES ----------------
 def clean_extracted_text(raw_text):
     if not raw_text:
         return ""
     text = raw_text.replace("\r", "\n")
-    junk_patterns = [r"SEE ALL NEWSLETTERS", r"e-?Paper", r"ADVERTISEMENT", r"LOGIN", r"Subscribe",
-                     r"Related Stories", r"Continue reading", r"Read more", r"Click here"]
+    junk_patterns = [
+        r"SEE ALL NEWSLETTERS", r"e-?Paper", r"ADVERTISEMENT", r"LOGIN", r"Subscribe",
+        r"Related Stories", r"Continue reading", r"Read more", r"Click here"
+    ]
     for p in junk_patterns:
         text = re.sub(p, " ", text, flags=re.I)
-    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) > 40 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())]
+    lines = [
+        ln.strip()
+        for ln in text.splitlines()
+        if len(ln.strip()) > 40 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())
+    ]
     cleaned = "\n\n".join(lines)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
 def extract_article_text_and_image(url, timeout=12):
     headers = {"User-Agent": "Mozilla/5.0"}
-    # newspaper3k
+    # newspaper3k attempt
     try:
         from newspaper import Article
         art = Article(url)
@@ -90,7 +108,7 @@ def extract_article_text_and_image(url, timeout=12):
     except Exception:
         pass
 
-    # basic fallback
+    # basic fallback — strip tags
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
         html = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', ' ', r.text)
@@ -132,30 +150,27 @@ def extract_json_substring(s):
                     return None
     return None
 
-# ---------------- UPSC relevance inference ----------------
+# ---------------- RELEVANCE INFERENCE ----------------
 RELEVANCE_KEYWORDS = {
     "environment": ("GS3 — Environment", ["environment", "climate", "biodiversity", "forest", "species", "pollution", "ghg", "ecosystem", "western ghats"]),
     "economy": ("GS3 — Economy", ["rbi", "inflation", "gdp", "fiscal", "budget", "economy", "exports", "imports", "trade"]),
     "polity": ("GS2 — Polity & Governance", ["cabinet", "supreme court", "high court", "constitution", "bill", "act", "parliament", "legislation", "govt"]),
-    "international": ("GS2 — International Relations", ["summit", "g20", "un", "treaty", "agreement", "nepal", "china", "us", "foreign"]),
-    "science": ("GS3 — Science & Tech", ["nobel", "vaccine", "vaccine", "space", "isro", "research", "scientists", "technology"]),
+    "international": ("GS2 — International Relations", ["summit", "g20", "un", "treaty", "agreement", "china", "india", "foreign"]),
+    "science": ("GS3 — Science & Tech", ["nobel", "vaccine", "space", "isro", "research", "scientists", "technology"]),
     "defence": ("GS3 — Security", ["defence", "army", "navy", "air force", "border", "terror", "military"]),
     "social": ("GS1 — Society", ["tribal", "tribe", "caste", "poverty", "education", "health", "disease", "nutrition"]),
     "ethics": ("GS4 — Ethics", ["ethics", "corruption", "integrity", "ethical", "code of conduct"]),
 }
 
 def infer_upsc_relevance(parsed, title, text):
-    # If model returned a good upsc_relevance, keep it
-    upsc_rel = parsed.get("upsc_relevance","") or ""
-    if upsc_rel and upsc_rel.strip().lower() not in ["general current affairs", "general", "n/a", ""]:
+    upsc_rel = (parsed.get("upsc_relevance") or "").strip()
+    if upsc_rel and upsc_rel.lower() not in ["general current affairs", "general", "n/a", ""]:
         return upsc_rel
-    # else infer from keywords in title+text
     combined = (title + " " + text).lower()
     for key, (label, kws) in RELEVANCE_KEYWORDS.items():
         for kw in kws:
             if kw in combined:
                 return label
-    # default: keep original or slightly improved phrase
     return "GS2/GS3 — Current Affairs"
 
 # ---------------- GROQ (primary) ----------------
@@ -164,20 +179,20 @@ def call_groq_with_retries(url, headers, payload, attempts=3, backoff=3, timeout
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             print(f"[groq] attempt {i+1} status {r.status_code}")
-            body_snippet = r.text[:800].replace("\n"," ")
+            body_snippet = r.text[:800].replace("\n", " ")
             print("[groq] body_snippet:", body_snippet)
             return r
         except Exception as ex:
             print(f"[groq] exception attempt {i+1}:", ex)
-            time.sleep(backoff * (i+1))
+            time.sleep(backoff * (i + 1))
     return None
 
 def groq_summarize(title, text, url, timeout=90):
     if not GROQ_API_KEY:
-        print("No GROQ_API_KEY in env")
+        print("No GROQ_API_KEY found.")
         return None
     prompt = f"""
-You are a UPSC current-affairs editor. Summarize this article in Drishti/InsightsonIndia style.
+You are a UPSC current-affairs editor. Summarize this article in Drishti/Insights style.
 Output valid JSON only with keys:
 include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
 
@@ -186,13 +201,13 @@ Article URL: {url}
 Article text (trimmed): {text[:3500]}
 """
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": GROQ_MODEL, "messages":[{"role":"user","content":prompt}], "temperature":0, "max_tokens":900}
+    payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 900}
     r = call_groq_with_retries(GROQ_ENDPOINT, headers, payload, attempts=3, backoff=3, timeout=timeout)
     if not r:
-        print("Groq: no response after retries")
+        print("Groq: no response after retries.")
         return None
     if r.status_code != 200:
-        print("Groq non-200:", r.status_code)
+        print("Groq returned non-200:", r.status_code)
         return None
     try:
         data = r.json()
@@ -222,7 +237,12 @@ URL: {url}
 Text (trimmed): {text[:3500]}
 """
     try:
-        resp = client.chat.completions.create(model=OPENAI_MODEL, messages=[{"role":"user","content":prompt}], max_tokens=700, temperature=0.0)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=700,
+            temperature=0.0,
+        )
         raw = resp.choices[0].message["content"]
         parsed = extract_json_substring(raw)
         return parsed
@@ -232,13 +252,13 @@ Text (trimmed): {text[:3500]}
 
 # ---------------- Offline fallback ----------------
 def offline_summary_fallback(title, text, url):
-    sents = [s.strip() for s in re.split(r'\.|\n', text) if len(s.strip())>40]
+    sents = [s.strip() for s in re.split(r'\.|\n', text) if len(s.strip()) > 40]
     context = sents[0] if sents else title
-    background = " ".join(sents[1:3]) if len(sents)>1 else ""
-    key_points = sents[1:5] if len(sents)>1 else [title]
+    background = " ".join(sents[1:3]) if len(sents) > 1 else ""
+    key_points = sents[1:5] if len(sents) > 1 else [title]
     return {
-        "include":"yes",
-        "category":"Misc",
+        "include": "yes",
+        "category": "Misc",
         "section_heading": title[:100],
         "context": context[:600],
         "background": background[:800],
@@ -246,150 +266,191 @@ def offline_summary_fallback(title, text, url):
         "impact": "",
         "upsc_relevance": "GS2/GS3 — Current Affairs",
         "source": url,
-        "image_bytes": None
+        "image_bytes": None,
     }
 
-# ---------------- Logo generator ----------------
-def generate_logo_bytes(text="DailyCAThroughAI", size=(420,80), bgcolor=(31,78,121), fg=(255,255,255)):
-    """Create a simple rectangular logo PNG bytes using PIL (compatible with Pillow ≥10)."""
+# ---------------- Logo generator (Pillow >=10 safe) ----------------
+def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78, 121), fg=(255, 255, 255)):
     try:
         from PIL import Image, ImageDraw, ImageFont
     except Exception:
         return None
-
     img = Image.new("RGB", size, bgcolor)
     draw = ImageDraw.Draw(img)
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
     except Exception:
         font = ImageFont.load_default()
-
-    # Pillow ≥10 fix: use textbbox() instead of textsize()
+    # compute text size robustly
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
     except Exception:
-        # fallback for very old versions
-        text_width, text_height = draw.textlength(text, font=font), 28
-
+        # fallback: use font mask size
+        try:
+            mask = font.getmask(text)
+            text_width, text_height = mask.size
+        except Exception:
+            text_width, text_height = (200, 28)
     x = (size[0] - text_width) / 2
     y = (size[1] - text_height) / 2
     draw.text((x, y), text, font=font, fill=fg)
-
     bio = io.BytesIO()
     img.save(bio, format="PNG")
     bio.seek(0)
     return bio.read()
 
-# ---------------- PDF generation with logo and boxed articles ----------------
+# ---------------- PDF generation with safe images and boxed cards ----------------
 def build_pdf(structured_items, pdf_path):
+    # imports inside function to avoid top-level dependency errors during import
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, KeepTogether
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, KeepTogether
     from reportlab.lib import colors
     from reportlab.lib.units import mm
     from PIL import Image as PILImage
     import io, datetime
 
-    doc = SimpleDocTemplate(pdf_path, pagesize=A4,
-                            rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+    )
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name='TitleLarge', fontSize=16, alignment=1, textColor=colors.HexColor("#1f4e79")))
-    styles.add(ParagraphStyle(name='Section', fontSize=12, leading=14, spaceAfter=4, spaceBefore=8, textColor=colors.HexColor("#1f4e79")))
-    styles.add(ParagraphStyle(name='Body', fontSize=10, leading=13))
-    styles.add(ParagraphStyle(name='Meta', fontSize=8, leading=10, textColor=colors.grey))
+    styles.add(ParagraphStyle(name="TitleLarge", fontSize=16, alignment=1, textColor=colors.HexColor("#1f4e79")))
+    styles.add(ParagraphStyle(name="Section", fontSize=12, leading=14, spaceAfter=4, spaceBefore=8, textColor=colors.HexColor("#1f4e79")))
+    styles.add(ParagraphStyle(name="Body", fontSize=10, leading=13))
+    styles.add(ParagraphStyle(name="Meta", fontSize=8, leading=10, textColor=colors.grey))
 
     content = []
     today_str = datetime.datetime.now().strftime("%d %B %Y")
-    # header with logo left and title right
-    logo_bytes = generate_logo_bytes()
-    left = []
-    if logo_bytes:
-        left.append(Image(io.BytesIO(logo_bytes), width=110, height=28))
-    left.append(Paragraph("", styles['Meta']))
-    right = Paragraph(f"<b>UPSC CURRENT AFFAIRS</b><br/>{today_str}", styles['TitleLarge'])
-    header_table = Table([[left, right]], colWidths=[120, doc.width-120])
-    header_table.setStyle(TableStyle([
-        ('VALIGN',(0,0),(1,0),'MIDDLE'),
-        ('BACKGROUND',(0,0),(-1,-1), colors.HexColor("#f4f8fb")),
-        ('LEFTPADDING',(0,0),(-1,-1),8),
-        ('RIGHTPADDING',(0,0),(-1,-1),8),
-        ('BOTTOMPADDING',(0,0),(-1,-1),8),
-    ]))
-    content.append(header_table)
-    content.append(Spacer(1,8))
 
-    # articles as boxed cards
-    order = ['GS2','GS3','GS1','GS4','CME','FFP','Mapping','Misc']
+    # header with logo left and title right (wrap left in KeepTogether)
+    logo_bytes = generate_logo_bytes()
+    left_items = []
+    if logo_bytes:
+        try:
+            left_items.append(RLImage(io.BytesIO(logo_bytes), width=110, height=28))
+        except Exception:
+            left_items.append(Paragraph("DailyCAThroughAI", styles["Body"]))
+    left_items.append(Paragraph("", styles["Meta"]))
+    right = Paragraph(f"<b>UPSC CURRENT AFFAIRS</b><br/>{today_str}", styles["TitleLarge"])
+    header_table = Table([[KeepTogether(left_items), right]], colWidths=[120, doc.width - 120])
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (1, 0), "MIDDLE"),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f8fb")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ]
+        )
+    )
+    content.append(header_table)
+    content.append(Spacer(1, 8))
+
+    order = ["GS2", "GS3", "GS1", "GS4", "CME", "FFP", "Mapping", "Misc"]
     for cat in order:
-        items = [it for it in structured_items if it.get('category')==cat]
+        items = [it for it in structured_items if it.get("category") == cat]
         if not items:
             continue
-        content.append(Paragraph(cat, styles['Section']))
+        content.append(Paragraph(cat, styles["Section"]))
         for it in items:
-            # build article body: left column text, right column image (if exists)
-            article_parts = []
-            # text block
-            txt = []
-            txt.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles['Body']))
-            if it.get('context'):
-                txt.append(Paragraph(f"<i>Context:</i> {it.get('context')}", styles['Body']))
-            if it.get('background'):
-                txt.append(Paragraph(f"<b>Background:</b> {it.get('background')}", styles['Body']))
-            for kp in it.get('key_points', []):
-                txt.append(Paragraph(f"• {kp}", styles['Body']))
-            if it.get('impact'):
-                txt.append(Paragraph(f"<b>Impact/Significance:</b> {it.get('impact')}", styles['Body']))
-            upsc_rel = it.get('upsc_relevance','')
+            # build text flowables
+            txt_flow = []
+            txt_flow.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles["Body"]))
+            if it.get("context"):
+                txt_flow.append(Paragraph(f"<i>Context:</i> {it.get('context')}", styles["Body"]))
+            if it.get("background"):
+                txt_flow.append(Paragraph(f"<b>Background:</b> {it.get('background')}", styles["Body"]))
+            for kp in it.get("key_points", []):
+                txt_flow.append(Paragraph(f"• {kp}", styles["Body"]))
+            if it.get("impact"):
+                txt_flow.append(Paragraph(f"<b>Impact/Significance:</b> {it.get('impact')}", styles["Body"]))
+            upsc_rel = it.get("upsc_relevance", "")
             if upsc_rel:
-                txt.append(Paragraph(f"<b>UPSC Relevance:</b> {upsc_rel}", styles['Body']))
-            if it.get('source'):
-                txt.append(Paragraph(f"Source: {it.get('source')}", styles['Meta']))
-            left_col = KeepTogether(txt)
+                txt_flow.append(Paragraph(f"<b>UPSC Relevance:</b> {upsc_rel}", styles["Body"]))
+            if it.get("source"):
+                txt_flow.append(Paragraph(f"Source: {it.get('source')}", styles["Meta"]))
+            left_col = KeepTogether(txt_flow)
 
-            # image column
-            imgb = it.get('image_bytes')
+            # safe image handling
+            imgb = it.get("image_bytes")
             right_col = None
             if imgb:
-    try:
-        img = PILImage.open(io.BytesIO(imgb))
-        img.load()
-        # handle crazy aspect ratios safely
-        w, h = img.size
-        aspect = h / float(w) if w else 1
-        max_w, max_h = 180, 120
-        if w > max_w or h > max_h:
-            img.thumbnail((max_w, max_h))
-        if aspect > 3 or aspect < 0.2:
-            # weird aspect ratio, skip
-            raise ValueError("Unusual aspect ratio")
-        bb = io.BytesIO()
-        img.save(bb, format='PNG')
-        bb.seek(0)
-        right_col = Image(bb, width=min(img.width, 150), height=min(img.height, 100))
-    except Exception as e:
-        print("⚠️ image skipped:", e)
-        right_col = None
-else:
-    right_col = None
+                try:
+                    img = PILImage.open(io.BytesIO(imgb))
+                    img.load()
+                    w, h = img.size
+                    # reject absurd sizes
+                    if w <= 0 or h <= 0 or w > 20000 or h > 20000:
+                        raise ValueError("image dimensions suspicious")
+                    # maintain safe thumbnail
+                    max_w, max_h = 180, 120
+                    if w > max_w or h > max_h:
+                        img.thumbnail((max_w, max_h))
+                    aspect = (img.height / img.width) if img.width else 1
+                    if aspect > 6 or aspect < 0.05:
+                        # unusual aspect, skip
+                        raise ValueError("unusual aspect ratio")
+                    bb = io.BytesIO()
+                    img.save(bb, format="PNG")
+                    bb.seek(0)
+                    img_w, img_h = img.size
+                    # create reportlab Image with those dimensions in points (~1 px ~ 1 pt here)
+                    right_col = RLImage(bb, width=min(img_w, 150), height=min(img_h, 100))
+                except Exception as e:
+                    print("⚠️ image skipped for article:", e)
+                    right_col = None
 
-            # arrange in table: text left, image right (if any)
-            if right_col:
-                tbl = Table([[left_col, right_col]], colWidths=[doc.width*0.66, doc.width*0.34])
-            else:
-                tbl = Table([[left_col]], colWidths=[doc.width])
-            tbl.setStyle(TableStyle([
-                ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor("#cfdff0")),
-                ('LEFTPADDING',(0,0),(-1,-1),8),
-                ('RIGHTPADDING',(0,0),(-1,-1),8),
-                ('TOPPADDING',(0,0),(-1,-1),6),
-                ('BOTTOMPADDING',(0,0),(-1,-1),6),
-            ]))
-            content.append(tbl)
-            content.append(Spacer(1,8))
-    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original sources (PIB, The Hindu).", styles['Meta']))
-    doc.build(content)
+            # create table: left text, right image (if any)
+            try:
+                if right_col:
+                    tbl = Table([[left_col, right_col]], colWidths=[doc.width * 0.66, doc.width * 0.34])
+                else:
+                    tbl = Table([[left_col]], colWidths=[doc.width])
+                tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cfdff0")),
+                            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                            ("TOPPADDING", (0, 0), (-1, -1), 6),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                        ]
+                    )
+                )
+                content.append(tbl)
+                content.append(Spacer(1, 8))
+            except Exception as e:
+                print("⚠️ table layout error for article, skipping article:", e)
+                # continue with next article
+
+    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original source and official releases (PIB/The Hindu).", styles["Meta"]))
+
+    # build doc with fallback
+    try:
+        doc.build(content)
+    except Exception as e:
+        print("⚠️ PDF build failed:", e)
+        # minimal fallback PDF to ensure a valid file is produced
+        try:
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import A4
+            c = canvas.Canvas(pdf_path, pagesize=A4)
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(50, 800, "UPSC Daily Brief (Partial)")
+            c.setFont("Helvetica", 10)
+            c.drawString(50, 780, "Some items were skipped due to layout issues. Check action logs for details.")
+            c.save()
+            print("Minimal fallback PDF created.")
+        except Exception as e2:
+            print("Failed to create minimal PDF fallback:", e2)
 
 # ---------------- EMAIL ----------------
 def email_pdf(pdf_path):
@@ -421,15 +482,16 @@ def email_pdf(pdf_path):
 # ---------------- MAIN FLOW ----------------
 def main():
     import feedparser
+
     openai_key = OPENAI_API_KEY
     entries = []
     for feed in RSS_FEEDS:
         try:
             d = feedparser.parse(feed)
             for e in d.entries:
-                entries.append({"title": e.get("title",""), "link": e.get("link","")})
+                entries.append({"title": e.get("title", ""), "link": e.get("link", "")})
         except Exception as ex:
-            print("Feed error", feed, ex)
+            print("Feed parse error for", feed, ex)
 
     seen = set()
     candidates = []
@@ -447,8 +509,8 @@ def main():
     for e in candidates:
         if included >= MAX_INCLUSIONS:
             break
-        title = e.get("title","")
-        link = e.get("link","")
+        title = e.get("title", "")
+        link = e.get("link", "")
         print("Processing:", title)
         text, img_bytes = extract_article_text_and_image(link)
         if not text:
@@ -456,31 +518,31 @@ def main():
             continue
 
         parsed = None
-        # 1) Groq primary
+        # 1) Try Groq
         parsed = groq_summarize(title, text, link)
         if parsed is None and openai_key:
-            print("Groq failed; trying OpenAI fallback")
+            print("Groq failed; trying OpenAI fallback.")
             parsed = openai_summarize(openai_key, title, text, link)
 
         if parsed is None:
-            print("Both Groq/OpenAI failed; using offline fallback for this item")
+            print("Both Groq/OpenAI failed; using offline fallback for this article.")
             parsed = offline_summary_fallback(title, text, link)
 
         if not parsed:
             print(" -> no parsed JSON; skipping")
             continue
 
-        # ensure include decision
-        if str(parsed.get("include","yes")).lower() != "yes":
+        # include decision
+        include_flag = str(parsed.get("include", "yes")).lower()
+        if include_flag != "yes":
             print(" -> model marked not relevant; skipping.")
             continue
 
-        # infer better upsc_relevance if generic
-        parsed.setdefault("upsc_relevance","")
-        better_rel = infer_upsc_relevance(parsed, title, text)
-        parsed["upsc_relevance"] = better_rel
+        # improve upsc_relevance where generic
+        parsed.setdefault("upsc_relevance", "")
+        parsed["upsc_relevance"] = infer_upsc_relevance(parsed, title, text)
 
-        # attach image and normalize key_points
+        # attach image and normalize fields
         parsed["image_bytes"] = img_bytes
         parsed.setdefault("key_points", [])
         parsed.setdefault("background", "")
@@ -497,19 +559,21 @@ def main():
         time.sleep(1.0)
 
     if not structured:
-        print("No UPSC-relevant items found; creating minimal fallback PDF with top headlines.")
+        print("No UPSC-relevant items found; building a minimal fallback PDF with top headlines.")
         for c in candidates[:3]:
-            structured.append({
-                "category":"Misc",
-                "section_heading": c.get("title",""),
-                "context": "Auto-added headline (no AI summary available today).",
-                "background": "",
-                "key_points": [c.get("title","")],
-                "impact": "",
-                "upsc_relevance": "",
-                "source": c.get("link",""),
-                "image_bytes": None
-            })
+            structured.append(
+                {
+                    "category": "Misc",
+                    "section_heading": c.get("title", ""),
+                    "context": "Auto-added headline — no AI summary available today.",
+                    "background": "",
+                    "key_points": [c.get("title", "")],
+                    "impact": "",
+                    "upsc_relevance": "",
+                    "source": c.get("link", ""),
+                    "image_bytes": None,
+                }
+            )
 
     pdf_name = f"UPSC_AI_Brief_{datetime.date.today().isoformat()}.pdf"
     build_pdf(structured, pdf_name)
