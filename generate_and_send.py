@@ -303,14 +303,14 @@ def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78
 
 # ---------------- PDF generation with safe images and boxed cards ----------------
 def build_pdf(structured_items, pdf_path):
-    # imports inside function to avoid top-level dependency errors during import
+    # imports inside to avoid top-level import issues
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, KeepTogether
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
     from reportlab.lib import colors
     from reportlab.lib.units import mm
     from PIL import Image as PILImage
-    import io, datetime
+    import io, datetime, math
 
     doc = SimpleDocTemplate(
         pdf_path,
@@ -329,17 +329,18 @@ def build_pdf(structured_items, pdf_path):
     content = []
     today_str = datetime.datetime.now().strftime("%d %B %Y")
 
-    # header with logo left and title right (wrap left in KeepTogether)
+    # Header (logo left, title right) — do NOT wrap in KeepTogether
     logo_bytes = generate_logo_bytes()
-    left_items = []
+    left_elem = None
     if logo_bytes:
         try:
-            left_items.append(RLImage(io.BytesIO(logo_bytes), width=110, height=28))
+            left_elem = RLImage(io.BytesIO(logo_bytes), width=110, height=28)
         except Exception:
-            left_items.append(Paragraph("DailyCAThroughAI", styles["Body"]))
-    left_items.append(Paragraph("", styles["Meta"]))
+            left_elem = Paragraph("DailyCAThroughAI", styles["Body"])
+    else:
+        left_elem = Paragraph("DailyCAThroughAI", styles["Body"])
     right = Paragraph(f"<b>UPSC CURRENT AFFAIRS</b><br/>{today_str}", styles["TitleLarge"])
-    header_table = Table([[KeepTogether(left_items), right]], colWidths=[120, doc.width - 120])
+    header_table = Table([[left_elem, right]], colWidths=[120, doc.width - 120])
     header_table.setStyle(
         TableStyle(
             [
@@ -360,85 +361,92 @@ def build_pdf(structured_items, pdf_path):
         if not items:
             continue
         content.append(Paragraph(cat, styles["Section"]))
+
         for it in items:
-            # build text flowables
-            txt_flow = []
-            txt_flow.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles["Body"]))
+            # Build list of paragraph Flowables for the article
+            paras = []
+            paras.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles["Body"]))
             if it.get("context"):
-                txt_flow.append(Paragraph(f"<i>Context:</i> {it.get('context')}", styles["Body"]))
+                paras.append(Paragraph(f"<i>Context:</i> {it.get('context')}", styles["Body"]))
             if it.get("background"):
-                txt_flow.append(Paragraph(f"<b>Background:</b> {it.get('background')}", styles["Body"]))
+                paras.append(Paragraph(f"<b>Background:</b> {it.get('background')}", styles["Body"]))
             for kp in it.get("key_points", []):
-                txt_flow.append(Paragraph(f"• {kp}", styles["Body"]))
+                paras.append(Paragraph(f"• {kp}", styles["Body"]))
             if it.get("impact"):
-                txt_flow.append(Paragraph(f"<b>Impact/Significance:</b> {it.get('impact')}", styles["Body"]))
+                paras.append(Paragraph(f"<b>Impact/Significance:</b> {it.get('impact')}", styles["Body"]))
             upsc_rel = it.get("upsc_relevance", "")
             if upsc_rel:
-                txt_flow.append(Paragraph(f"<b>UPSC Relevance:</b> {upsc_rel}", styles["Body"]))
+                paras.append(Paragraph(f"<b>UPSC Relevance:</b> {upsc_rel}", styles["Body"]))
             if it.get("source"):
-                txt_flow.append(Paragraph(f"Source: {it.get('source')}", styles["Meta"]))
-            left_col = KeepTogether(txt_flow)
+                paras.append(Paragraph(f"Source: {it.get('source')}", styles["Meta"]))
 
-            # safe image handling
+            # Split paras into chunks so each table row isn't too tall
+            # Adjust chunk_size if you want denser cards (smaller = safer)
+            chunk_size = 6
+            chunks = [paras[i:i + chunk_size] for i in range(0, len(paras), chunk_size)]
+
+            # Prepare the article image (only include on the first chunk)
             imgb = it.get("image_bytes")
-            right_col = None
             if imgb:
+                right_col_first = None
                 try:
                     img = PILImage.open(io.BytesIO(imgb))
                     img.load()
                     w, h = img.size
-                    # reject absurd sizes
                     if w <= 0 or h <= 0 or w > 20000 or h > 20000:
                         raise ValueError("image dimensions suspicious")
-                    # maintain safe thumbnail
                     max_w, max_h = 180, 120
                     if w > max_w or h > max_h:
                         img.thumbnail((max_w, max_h))
                     aspect = (img.height / img.width) if img.width else 1
                     if aspect > 6 or aspect < 0.05:
-                        # unusual aspect, skip
                         raise ValueError("unusual aspect ratio")
                     bb = io.BytesIO()
                     img.save(bb, format="PNG")
                     bb.seek(0)
                     img_w, img_h = img.size
-                    # create reportlab Image with those dimensions in points (~1 px ~ 1 pt here)
-                    right_col = RLImage(bb, width=min(img_w, 150), height=min(img_h, 100))
+                    right_col_first = RLImage(bb, width=min(img_w, 150), height=min(img_h, 100))
                 except Exception as e:
                     print("⚠️ image skipped for article:", e)
-                    right_col = None
+                    right_col_first = None
+            else:
+                right_col_first = None
 
-            # create table: left text, right image (if any)
-            try:
-                if right_col:
-                    tbl = Table([[left_col, right_col]], colWidths=[doc.width * 0.66, doc.width * 0.34])
-                else:
-                    tbl = Table([[left_col]], colWidths=[doc.width])
-                tbl.setStyle(
-                    TableStyle(
-                        [
-                            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cfdff0")),
-                            ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                            ("TOPPADDING", (0, 0), (-1, -1), 6),
-                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                        ]
+            # For each chunk, create a card (table). On the first chunk include the image; subsequent chunks are text-only.
+            for idx, chunk in enumerate(chunks):
+                try:
+                    if idx == 0 and right_col_first:
+                        tbl = Table([[chunk, right_col_first]], colWidths=[doc.width * 0.66, doc.width * 0.34])
+                    else:
+                        tbl = Table([[chunk]], colWidths=[doc.width])
+                    tbl.setStyle(
+                        TableStyle(
+                            [
+                                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cfdff0")),
+                                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                            ]
+                        )
                     )
-                )
-                content.append(tbl)
-                content.append(Spacer(1, 8))
-            except Exception as e:
-                print("⚠️ table layout error for article, skipping article:", e)
-                # continue with next article
+                    content.append(tbl)
+                    content.append(Spacer(1, 8))
+                except Exception as e:
+                    # If a single chunk still fails (very unlikely), add paragraphs directly to content as fallback
+                    print("⚠️ table layout error for chunk, falling back to paragraphs:", e)
+                    for p in chunk:
+                        content.append(p)
+                    content.append(Spacer(1, 8))
 
-    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original source and official releases (PIB/The Hindu).", styles["Meta"]))
+    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original sources (PIB/The Hindu).", styles["Meta"]))
 
-    # build doc with fallback
+    # Build doc with a safe fallback if build fails
     try:
         doc.build(content)
     except Exception as e:
         print("⚠️ PDF build failed:", e)
-        # minimal fallback PDF to ensure a valid file is produced
+        # Create a minimal fallback PDF to ensure an output is produced
         try:
             from reportlab.pdfgen import canvas
             from reportlab.lib.pagesizes import A4
@@ -451,7 +459,6 @@ def build_pdf(structured_items, pdf_path):
             print("Minimal fallback PDF created.")
         except Exception as e2:
             print("Failed to create minimal PDF fallback:", e2)
-
 # ---------------- EMAIL ----------------
 def email_pdf(pdf_path):
     SMTP_USER = os.environ.get("SMTP_USER")
