@@ -352,15 +352,27 @@ def build_pdf(structured_items, pdf_path):
             imgb = it.get('image_bytes')
             right_col = None
             if imgb:
-                try:
-                    img = PILImage.open(io.BytesIO(imgb))
-                    img.thumbnail((220,120))
-                    bb = io.BytesIO()
-                    img.save(bb, format='PNG')
-                    bb.seek(0)
-                    right_col = Image(bb, width=120, height=80)
-                except Exception:
-                    right_col = None
+    try:
+        img = PILImage.open(io.BytesIO(imgb))
+        img.load()
+        # handle crazy aspect ratios safely
+        w, h = img.size
+        aspect = h / float(w) if w else 1
+        max_w, max_h = 180, 120
+        if w > max_w or h > max_h:
+            img.thumbnail((max_w, max_h))
+        if aspect > 3 or aspect < 0.2:
+            # weird aspect ratio, skip
+            raise ValueError("Unusual aspect ratio")
+        bb = io.BytesIO()
+        img.save(bb, format='PNG')
+        bb.seek(0)
+        right_col = Image(bb, width=min(img.width, 150), height=min(img.height, 100))
+    except Exception as e:
+        print("⚠️ image skipped:", e)
+        right_col = None
+else:
+    right_col = None
 
             # arrange in table: text left, image right (if any)
             if right_col:
