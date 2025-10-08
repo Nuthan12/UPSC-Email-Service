@@ -270,16 +270,35 @@ def groq_summarize(title, text, url, timeout=90):
         return None
     trimmed = safe_trim(text, max_chars=3500)
     prompt = f"""
-You are a UPSC current-affairs analyst producing InsightsIAS-style notes.
-Respond STRICTLY with valid JSON only and nothing else. Keys required:
-include, category, section_heading, context, background, key_points (list), impact, upsc_relevance, source
+You are an expert UPSC content analyst writing like InsightsIAS.
 
-Article title: {title}
-Article URL: {url}
-Article text (trimmed, keep sentences intact): {trimmed}
+Generate a structured current affairs brief in this JSON format:
+{{
+  "include": "yes/no",
+  "category": "GS1/GS2/GS3/GS4/CME/Mapping/FFP",
+  "section_heading": "",
+  "context": "",
+  "about": "",
+  "sub_sections": [
+      {{"heading": "Composition / Key Aspects", "points": []}},
+      {{"heading": "Emerging Trends / Analysis", "points": []}},
+      {{"heading": "UPSC Linkages", "points": []}}
+  ],
+  "facts_and_data": [],
+  "upsc_relevance": "e.g., GS3 — Health / CME"
+}}
 
-Decide include: "yes" if relevant for UPSC (GS papers or FFP/CME/Mapping), otherwise "no".
-Important: do not invent facts. If the article text is incomplete/truncated, set context to "SOURCE_ONLY".
+Guidelines:
+- Follow the exact tone and layout of InsightsIAS (Context → About → Sub-sections with bold titles and bullet points).
+- Mention factual data, stats, and policy/program names wherever possible.
+- For CME articles, add analytical observations and lessons for Mains.
+- If the article is from PIB or DrishtiIAS, include schemes or ministries.
+- Use short but information-rich sentences.
+- Do NOT invent facts.
+
+Title: {title}
+Source URL: {url}
+Article Text: {safe_trim(text)}
 """
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 900}
