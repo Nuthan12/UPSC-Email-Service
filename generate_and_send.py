@@ -2,12 +2,17 @@
 """
 generate_and_send.py
 
-Finalized UPSC Daily Brief generator:
-- Groq primary summarization (GROQ_API_KEY required in secrets)
-- Optional OpenAI fallback (OPENAI_API_KEY)
-- Offline fallback to ensure a PDF is always produced
-- Clean extraction, images embedded safely, logo generation compatible with Pillow >=10
-- Robust PDF layout (boxed cards) with image on the right
+Final UPSC Daily Brief generator with:
+- Groq primary summarization, OpenAI optional fallback, offline fallback
+- UPSC-focused feed filtering, UPSC keyword filter
+- Improved categorization (Step 4): maps topics to GS papers / categories
+- Safe image handling, programmatic logo, boxed card PDF layout with chunking
+- Ensures a PDF is always produced and emailed
+
+Requirements (GitHub Actions):
+- Secrets: GROQ_API_KEY, SMTP_USER, SMTP_PASSWORD, EMAIL_TO
+- Optional: OPENAI_API_KEY
+- Dependencies: feedparser, newspaper3k, reportlab, requests, pillow, readability-lxml, openai (if used)
 """
 
 import os
@@ -19,9 +24,7 @@ import smtplib
 import io
 import datetime
 import requests
-
 from email.message import EmailMessage
-from urllib.parse import urlparse
 
 # ---------------- CONFIG ----------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
@@ -30,17 +33,38 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "mixtral-8x7b")
 
+# Curated UPSC-centric feeds (prioritise UPSC-focused sources)
 RSS_FEEDS = [
     "https://www.drishtiias.com/feed",
     "https://www.insightsonindia.com/feed",
     "https://pib.gov.in/AllRelFeeds.aspx?Format=RSS",
     "https://prsindia.org/theprsblog/feed",
     "https://www.thehindu.com/news/national/feeder/default.rss",
-    "https://www.downtoearth.org.in/rss/all.xml"
+    "https://www.downtoearth.org.in/rss/all.xml",
 ]
 
-MAX_CANDIDATES = 25
+MAX_CANDIDATES = 30
 MAX_INCLUSIONS = 12
+
+# Keywords to quickly filter out non-UPSC items
+UPSC_KEYWORDS = [
+    "upsc", "governance", "policy", "environment", "economy",
+    "ethics", "international", "constitution", "biodiversity",
+    "reform", "initiative", "scheme", "pib", "report", "summit",
+    "nobel", "isro", "climate", "vaccine", "trade", "rbi", "supreme court"
+]
+
+# Mapping keywords → category label (Step 4 improved categorization)
+CATEGORY_KEYWORDS = {
+    "GS1": ["tribal", "caste", "society", "population", "culture", "heritage", "migration", "demography", "education", "health"],
+    "GS2": ["constitution", "cabinet", "parliament", "legislation", "judgment", "supreme court", "high court", "governance", "police", "bureaucracy", "policy", "dpr", "pib"],
+    "GS3": ["economy", "gdp", "inflation", "rbi", "bank", "finance", "industry", "agriculture", "infrastructure", "climate", "environment", "isro", "science", "technology", "nobel", "biodiversity", "ecosystem"],
+    "GS4": ["ethics", "integrity", "corruption", "values", "moral", "public service", "code of conduct"],
+    "CME": ["study", "index", "report", "research", "survey", "analysis"],
+    "Mapping": ["map", "location", "geography", "boundary", "river", "plateau"],
+    "FFP": ["finance", "fiscal", "budget", "public finance"],
+    "Misc": []
+}
 
 # ---------------- UTILITIES ----------------
 def clean_extracted_text(raw_text):
@@ -53,11 +77,7 @@ def clean_extracted_text(raw_text):
     ]
     for p in junk_patterns:
         text = re.sub(p, " ", text, flags=re.I)
-    lines = [
-        ln.strip()
-        for ln in text.splitlines()
-        if len(ln.strip()) > 40 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())
-    ]
+    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) > 40 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())]
     cleaned = "\n\n".join(lines)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
@@ -149,7 +169,24 @@ def extract_json_substring(s):
                     return None
     return None
 
-# ---------------- RELEVANCE INFERENCE ----------------
+# ---------------- Categorization (Step 4) ----------------
+def classify_category(title, text):
+    """Return a category string (GS1, GS2, GS3, GS4, CME, Mapping, FFP, Misc)."""
+    combined = (title + " " + text).lower()
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        for kw in kws:
+            if kw in combined:
+                return cat
+    # heuristics for single-word signals
+    if "nobel" in combined or "research" in combined:
+        return "GS3"
+    if "ethic" in combined or "corruption" in combined:
+        return "GS4"
+    if "map" in combined or "geograph" in combined:
+        return "Mapping"
+    return "Misc"
+
+# ---------------- UPSC relevance inference ----------------
 RELEVANCE_KEYWORDS = {
     "environment": ("GS3 — Environment", ["environment", "climate", "biodiversity", "forest", "species", "pollution", "ghg", "ecosystem", "western ghats"]),
     "economy": ("GS3 — Economy", ["rbi", "inflation", "gdp", "fiscal", "budget", "economy", "exports", "imports", "trade"]),
@@ -172,7 +209,7 @@ def infer_upsc_relevance(parsed, title, text):
                 return label
     return "GS2/GS3 — Current Affairs"
 
-# ---------------- GROQ (primary) ----------------
+# ---------------- GROQ summarization (primary) ----------------
 def call_groq_with_retries(url, headers, payload, attempts=3, backoff=3, timeout=90):
     for i in range(attempts):
         try:
@@ -191,13 +228,15 @@ def groq_summarize(title, text, url, timeout=90):
         print("No GROQ_API_KEY found.")
         return None
     prompt = f"""
-You are a UPSC current-affairs editor. Summarize this article in Drishti/Insights style.
-Output valid JSON only with keys:
-include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
+You are a UPSC current-affairs analyst producing InsightsIAS-style notes.
+Respond STRICTLY with valid JSON only and nothing else. Keys required:
+include, category, section_heading, context, background, key_points (list), impact, upsc_relevance, source
 
 Article title: {title}
 Article URL: {url}
 Article text (trimmed): {text[:3500]}
+
+Decide include: "yes" if relevant for UPSC (GS papers or FFP/CME/Mapping), otherwise "no".
 """
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 900}
@@ -280,13 +319,11 @@ def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 28)
     except Exception:
         font = ImageFont.load_default()
-    # compute text size robustly
     try:
         bbox = draw.textbbox((0, 0), text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
     except Exception:
-        # fallback: use font mask size
         try:
             mask = font.getmask(text)
             text_width, text_height = mask.size
@@ -300,16 +337,15 @@ def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78
     bio.seek(0)
     return bio.read()
 
-# ---------------- PDF generation with safe images and boxed cards ----------------
+# ---------------- PDF generation with safe images and chunking ----------------
 def build_pdf(structured_items, pdf_path):
-    # imports inside to avoid top-level import issues
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle
     from reportlab.lib import colors
     from reportlab.lib.units import mm
     from PIL import Image as PILImage
-    import io, datetime, math
+    import io, datetime
 
     doc = SimpleDocTemplate(
         pdf_path,
@@ -328,7 +364,7 @@ def build_pdf(structured_items, pdf_path):
     content = []
     today_str = datetime.datetime.now().strftime("%d %B %Y")
 
-    # Header (logo left, title right) — do NOT wrap in KeepTogether
+    # Header (logo left, title right)
     logo_bytes = generate_logo_bytes()
     left_elem = None
     if logo_bytes:
@@ -360,9 +396,8 @@ def build_pdf(structured_items, pdf_path):
         if not items:
             continue
         content.append(Paragraph(cat, styles["Section"]))
-
         for it in items:
-            # Build list of paragraph Flowables for the article
+            # Build flowable paragraphs
             paras = []
             paras.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles["Body"]))
             if it.get("context"):
@@ -379,15 +414,14 @@ def build_pdf(structured_items, pdf_path):
             if it.get("source"):
                 paras.append(Paragraph(f"Source: {it.get('source')}", styles["Meta"]))
 
-            # Split paras into chunks so each table row isn't too tall
-            # Adjust chunk_size if you want denser cards (smaller = safer)
+            # Split into chunks to avoid layout overflow
             chunk_size = 6
             chunks = [paras[i:i + chunk_size] for i in range(0, len(paras), chunk_size)]
 
-            # Prepare the article image (only include on the first chunk)
+            # Prepare image for first chunk
             imgb = it.get("image_bytes")
+            right_col_first = None
             if imgb:
-                right_col_first = None
                 try:
                     img = PILImage.open(io.BytesIO(imgb))
                     img.load()
@@ -408,10 +442,7 @@ def build_pdf(structured_items, pdf_path):
                 except Exception as e:
                     print("⚠️ image skipped for article:", e)
                     right_col_first = None
-            else:
-                right_col_first = None
 
-            # For each chunk, create a card (table). On the first chunk include the image; subsequent chunks are text-only.
             for idx, chunk in enumerate(chunks):
                 try:
                     if idx == 0 and right_col_first:
@@ -432,7 +463,6 @@ def build_pdf(structured_items, pdf_path):
                     content.append(tbl)
                     content.append(Spacer(1, 8))
                 except Exception as e:
-                    # If a single chunk still fails (very unlikely), add paragraphs directly to content as fallback
                     print("⚠️ table layout error for chunk, falling back to paragraphs:", e)
                     for p in chunk:
                         content.append(p)
@@ -440,12 +470,10 @@ def build_pdf(structured_items, pdf_path):
 
     content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original sources (PIB/The Hindu).", styles["Meta"]))
 
-    # Build doc with a safe fallback if build fails
     try:
         doc.build(content)
     except Exception as e:
         print("⚠️ PDF build failed:", e)
-        # Create a minimal fallback PDF to ensure an output is produced
         try:
             from reportlab.pdfgen import canvas
             from reportlab.lib.pagesizes import A4
@@ -458,6 +486,7 @@ def build_pdf(structured_items, pdf_path):
             print("Minimal fallback PDF created.")
         except Exception as e2:
             print("Failed to create minimal PDF fallback:", e2)
+
 # ---------------- EMAIL ----------------
 def email_pdf(pdf_path):
     SMTP_USER = os.environ.get("SMTP_USER")
@@ -489,7 +518,6 @@ def email_pdf(pdf_path):
 def main():
     import feedparser
 
-    openai_key = OPENAI_API_KEY
     entries = []
     for feed in RSS_FEEDS:
         try:
@@ -499,6 +527,7 @@ def main():
         except Exception as ex:
             print("Feed parse error for", feed, ex)
 
+    # dedupe and limit
     seen = set()
     candidates = []
     for e in entries:
@@ -518,6 +547,21 @@ def main():
         title = e.get("title", "")
         link = e.get("link", "")
         print("Processing:", title)
+
+        # quick UPSC keyword filter — skip entirely if clearly unrelated
+        text_preview = ""
+        try:
+            # lightweight fetch first 2000 chars for quick filter
+            r = requests.get(link, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                text_preview = re.sub(r'<[^>]+>', ' ', r.text)[:3000].lower()
+        except Exception:
+            text_preview = ""
+
+        if not any(k in (title + " " + text_preview).lower() for k in UPSC_KEYWORDS):
+            print(" -> skipped by UPSC keyword filter")
+            continue
+
         text, img_bytes = extract_article_text_and_image(link)
         if not text:
             print(" -> no extractable text, skipping")
@@ -526,12 +570,14 @@ def main():
         parsed = None
         # 1) Try Groq
         parsed = groq_summarize(title, text, link)
-        if parsed is None and openai_key:
+        # 2) OpenAI fallback (optional)
+        if parsed is None and OPENAI_API_KEY:
             print("Groq failed; trying OpenAI fallback.")
-            parsed = openai_summarize(openai_key, title, text, link)
+            parsed = openai_summarize(OPENAI_API_KEY, title, text, link)
 
+        # 3) Offline fallback
         if parsed is None:
-            print("Both Groq/OpenAI failed; using offline fallback for this article.")
+            print("Both Groq/OpenAI failed; using offline fallback.")
             parsed = offline_summary_fallback(title, text, link)
 
         if not parsed:
@@ -544,7 +590,15 @@ def main():
             print(" -> model marked not relevant; skipping.")
             continue
 
-        # improve upsc_relevance where generic
+        # assign category: prefer model output if sensible, else use classifier
+        model_cat = parsed.get("category", "") or ""
+        if model_cat and model_cat.strip():
+            category = model_cat
+        else:
+            category = classify_category(title, text)
+        parsed["category"] = category
+
+        # improve upsc_relevance if generic
         parsed.setdefault("upsc_relevance", "")
         parsed["upsc_relevance"] = infer_upsc_relevance(parsed, title, text)
 
@@ -565,21 +619,19 @@ def main():
         time.sleep(1.0)
 
     if not structured:
-        print("No UPSC-relevant items found; building a minimal fallback PDF with top headlines.")
+        print("No UPSC-relevant items found; building minimal fallback PDF with top headlines.")
         for c in candidates[:3]:
-            structured.append(
-                {
-                    "category": "Misc",
-                    "section_heading": c.get("title", ""),
-                    "context": "Auto-added headline — no AI summary available today.",
-                    "background": "",
-                    "key_points": [c.get("title", "")],
-                    "impact": "",
-                    "upsc_relevance": "",
-                    "source": c.get("link", ""),
-                    "image_bytes": None,
-                }
-            )
+            structured.append({
+                "category": "Misc",
+                "section_heading": c.get("title", ""),
+                "context": "Auto-added headline — no AI summary available today.",
+                "background": "",
+                "key_points": [c.get("title", "")],
+                "impact": "",
+                "upsc_relevance": "",
+                "source": c.get("link", ""),
+                "image_bytes": None
+            })
 
     pdf_name = f"UPSC_AI_Brief_{datetime.date.today().isoformat()}.pdf"
     build_pdf(structured, pdf_name)
