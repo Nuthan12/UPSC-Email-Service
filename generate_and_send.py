@@ -31,13 +31,12 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "mixtral-8x7b")
 
 RSS_FEEDS = [
+    "https://www.drishtiias.com/feed",
+    "https://www.insightsonindia.com/feed",
     "https://pib.gov.in/AllRelFeeds.aspx?Format=RSS",
     "https://prsindia.org/theprsblog/feed",
     "https://www.thehindu.com/news/national/feeder/default.rss",
-    "https://www.thehindu.com/opinion/lead/feeder/default.rss",
-    "https://www.drishtiias.com/feed",
-    "https://www.insightsonindia.com/feed",
-    "https://www.downtoearth.org.in/rss/all.xml",
+    "https://www.downtoearth.org.in/rss/all.xml"
 ]
 
 MAX_CANDIDATES = 25
