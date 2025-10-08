@@ -116,57 +116,61 @@ def extract_article_text_and_image(url, timeout=12):
 
     return "", None
 
-# ---------- OPENAI: relevance + Drishti-style writeup ----------
+# ---------- New OpenAI function (for openai>=1.0.0) ----------
 def ask_openai_for_structured(openai_key, title, text, url):
-    """Ask OpenAI to decide relevance and return a strict JSON in Drishti style.
-    JSON fields:
-      include: "yes" or "no"
-      category: GS1/GS2/GS3/GS4/FFP/CME/Mapping/Misc
-      section_heading: short heading
-      context: 1-2 sentences
-      background: 2-3 sentences (concise)
-      key_points: list of 3-5 short bullets
-      impact: 1 sentence
-      upsc_relevance: 1 short sentence
-      source: original source/link
     """
-    import openai
-    openai.api_key = openai_key
+    Uses the new OpenAI Python client (OpenAI()) to request a strict JSON
+    Drishti-style output. Compatible with openai package >= 1.0.0.
+    """
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        print("OpenAI package not installed or import failed:", e)
+        return None
+
+    client = OpenAI(api_key=openai_key)
+
     prompt = f"""
-You are an editor that prepares concise Drishti/InsightsonIndia-style current affairs writeups for UPSC exam preparation.
-Given an article title, URL and article text, do two things:
-1) Decide if this article is relevant for UPSC syllabus (include only if yes).
-2) If relevant, produce a JSON object (ONLY JSON, no extra commentary) with exact keys:
-   include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
-- 'include' must be "yes" or "no".
-- 'category' must be one of: GS1, GS2, GS3, GS4, FFP, CME, Mapping, Misc.
-- 'section_heading' should be a short headline (<=10 words).
-- 'context' 1-2 sentences summary of what happened.
-- 'background' 2-3 short sentences of necessary background.
-- 'key_points' must be a JSON array of 3-5 short bullets (each <= 25 words).
-- 'impact' 1 sentence on broader significance.
-- 'upsc_relevance' 1 sentence telling how it ties to the syllabus (which GS paper/section).
-- 'source' should include the original URL.
+You are an editor that prepares concise Drishti/InsightsonIndia-style current affairs writeups for UPSC.
+Given article title, URL and article text, produce ONLY a JSON object with keys:
+include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
+
+- include: "yes" or "no"
+- category: GS1/GS2/GS3/GS4/FFP/CME/Mapping/Misc
+- section_heading: short heading (<=10 words)
+- context: 1-2 sentences
+- background: 2-3 concise sentences
+- key_points: array of 3-5 short bullets (<=25 words each)
+- impact: 1 sentence
+- upsc_relevance: 1 short sentence
+- source: original URL
 
 Article Title: {title}
 Article URL: {url}
 Article text (first 3500 chars): {text[:3500]}
 
-Be strict: only output valid JSON. Keep language exam-focused, neutral, and concise.
+Be strict: output valid JSON only, nothing else.
 """
     try:
-        resp = openai.ChatCompletion.create(
+        resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"user", "content": prompt}],
-            max_tokens=450,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=700,
             temperature=0.0,
         )
-        out = resp.choices[0].message.content.strip()
-        # Some models may wrap the JSON in triple backticks — extract JSON substring
-        j = extract_json_substring(out)
-        return j
-    except Exception as e:
-        print("OpenAI error:", e)
+        # New response structure: resp.choices[0].message.content
+        raw = resp.choices[0].message["content"]
+        # extract JSON object substring if wrapped
+        parsed = extract_json_substring(raw)
+        if not parsed:
+            # fallback: try to parse direct raw
+            try:
+                return json.loads(raw)
+            except Exception:
+                return None
+        return parsed
+    except Exception as ex:
+        print("OpenAI API call failed:", ex)
         return None
 
 def extract_json_substring(s):
