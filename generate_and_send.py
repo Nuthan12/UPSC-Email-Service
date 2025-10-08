@@ -2,25 +2,36 @@
 """
 generate_and_send.py
 
-AI-powered UPSC Daily Brief using Ollama (primary) and optional OpenAI (fallback).
-- Ollama endpoint: https://ollama-server-y6ln.onrender.com (user provided)
-- Produces Drishti/InsightsonIndia-style structured JSON for each article:
-  include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
-- Builds a clean PDF with thumbnails and emails it.
+AI-powered UPSC Daily Brief using Groq API (primary), optional OpenAI fallback,
+and an offline fallback to ensure you always receive a PDF.
 
-Dependencies required in workflow:
-pip install feedparser newspaper3k reportlab openai requests pillow readability-lxml
+Prereqs (Actions / environment):
+- Secrets: GROQ_API_KEY, SMTP_USER, SMTP_PASSWORD, EMAIL_TO
+- Optional: OPENAI_API_KEY (if you want OpenAI as a second-tier fallback)
+- Dependencies: feedparser, newspaper3k, reportlab, requests, pillow, readability-lxml
+  (Install in workflow: pip install feedparser newspaper3k reportlab requests pillow readability-lxml openai)
 """
 
-import os, re, time, json, ssl, smtplib, io, datetime, requests
+import os
+import re
+import time
+import json
+import ssl
+import smtplib
+import io
+import datetime
+import requests
 from email.message import EmailMessage
 from urllib.parse import urlparse
 
 # ---------------- CONFIG ----------------
-OLLAMA_BASE = os.environ.get("OLLAMA_BASE", "https://ollama-server-y6ln.onrender.com")
-OLLAMA_API = OLLAMA_BASE.rstrip("/") + "/api/generate"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"  # Groq-compatible OpenAI path
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # optional
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "mixtral-8x7b")     # change to "llama3-8b" if preferred
 
-# Curated UPSC-centric feeds (you can add more)
+# Curated UPSC-centric feeds
 RSS_FEEDS = [
     "https://pib.gov.in/AllRelFeeds.aspx?Format=RSS",
     "https://prsindia.org/theprsblog/feed",
@@ -33,12 +44,9 @@ RSS_FEEDS = [
 
 MAX_CANDIDATES = 25
 MAX_INCLUSIONS = 12
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")  # default model name on your Ollama server
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # if you use OpenAI
 
-# ---------------- HELPERS ----------------
+# ---------------- UTILITIES ----------------
 def clean_extracted_text(raw_text):
-    """Remove nav/footer noise and very short lines. Return cleaned paragraphs."""
     if not raw_text:
         return ""
     text = raw_text.replace("\r", "\n")
@@ -46,19 +54,14 @@ def clean_extracted_text(raw_text):
                      r"Related Stories", r"Continue reading", r"Read more", r"Click here"]
     for p in junk_patterns:
         text = re.sub(p, " ", text, flags=re.I)
-    # remove very short lines / menus
     lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) > 40 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())]
     cleaned = "\n\n".join(lines)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
 def extract_article_text_and_image(url, timeout=12):
-    """
-    Try newspaper3k, then readability, then a basic fallback.
-    Returns (clean_text, image_bytes_or_None).
-    """
     headers = {"User-Agent": "Mozilla/5.0"}
-    # newspaper3k
+    # newspaper3k attempt
     try:
         from newspaper import Article
         art = Article(url)
@@ -79,7 +82,7 @@ def extract_article_text_and_image(url, timeout=12):
     except Exception:
         pass
 
-    # readability-lxml fallback
+    # readability fallback
     try:
         from readability import Document
         r = requests.get(url, timeout=timeout, headers=headers)
@@ -101,10 +104,10 @@ def extract_article_text_and_image(url, timeout=12):
     except Exception:
         pass
 
-    # basic fallback: strip tags
+    # basic fallback
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
-        html = re.sub(r'(?is)<(script|style).*?>.*?(</\\1>)', ' ', r.text)
+        html = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', ' ', r.text)
         stripped = re.sub(r'<[^>]+>', ' ', html)
         stripped = ' '.join(stripped.split())
         stripped = clean_extracted_text(stripped)
@@ -125,7 +128,6 @@ def extract_article_text_and_image(url, timeout=12):
     return "", None
 
 def extract_json_substring(s):
-    """Extract first {...} JSON substring and return dict or None."""
     if not s:
         return None
     start = s.find('{')
@@ -144,71 +146,64 @@ def extract_json_substring(s):
                     return None
     return None
 
-# ---------------- Ollama summarization (primary) ----------------
-def ollama_summarize(title, text, url, model=OLLAMA_MODEL, timeout=120):
-    """
-    Call Ollama server /api/generate with a prompt that asks for strict JSON.
-    Expect a JSON-like reply in the response field. Returns dict or None.
-    """
-    prompt = f"""
-You are an editor preparing concise Drishti/InsightsonIndia-style current affairs notes for UPSC.
-Given the article title, URL, and article text, decide if it should be included for UPSC preparation (include: "yes"/"no").
-If include = "yes", produce EXACT JSON ONLY with keys:
-include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
+# ---------------- GROQ (primary) ----------------
+def call_with_retries(url, headers, payload, attempts=3, backoff=3, timeout=90):
+    for i in range(attempts):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            print(f"[groq] attempt {i+1} status {r.status_code}")
+            # print short body snippet for debugging
+            body_snippet = r.text[:800].replace("\n", " ")
+            print("[groq] body_snippet:", body_snippet)
+            return r
+        except Exception as ex:
+            print(f"[groq] exception on attempt {i+1}:", ex)
+            time.sleep(backoff * (i+1))
+    return None
 
-- category: one of [GS1, GS2, GS3, GS4, FFP, CME, Mapping, Misc]
-- section_heading: short heading <=10 words
-- context: 1-2 sentences
-- background: 2-3 concise sentences
-- key_points: array/list of 3-5 short bullets (<=25 words each)
-- impact: 1 sentence
-- upsc_relevance: 1 short sentence (which GS paper and why)
-- source: the article URL
+def groq_summarize(title, text, url, timeout=90):
+    if not GROQ_API_KEY:
+        print("No GROQ_API_KEY found.")
+        return None
+    prompt = f"""
+You are a UPSC current-affairs editor. Summarize this article in Drishti/InsightsIAS style.
+Output valid JSON only with keys:
+include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
 
 Article title: {title}
 Article URL: {url}
 Article text (trimmed): {text[:3500]}
-
-Output strict JSON only.
 """
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": 800,
-        # Ollama APIs may vary; many accept "temperature" / "top_p" etc.
-        "temperature": 0.0
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
     }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 900
+    }
+    r = call_with_retries(GROQ_ENDPOINT, headers, payload, attempts=3, backoff=3, timeout=timeout)
+    if not r:
+        print("Groq: no response after retries.")
+        return None
+    if r.status_code != 200:
+        print("Groq returned non-200:", r.status_code)
+        return None
     try:
-        r = requests.post(OLLAMA_API, json=payload, timeout=timeout)
-        if r.status_code != 200:
-            print("Ollama returned status", r.status_code, r.text[:400])
-            return None
         data = r.json()
-        # Ollama may return {"response": "..."} or similar; try common keys
-        resp_text = None
-        if isinstance(data, dict):
-            if "response" in data:
-                resp_text = data["response"]
-            elif "result" in data and isinstance(data["result"], dict) and "content" in data["result"]:
-                resp_text = data["result"]["content"]
-            else:
-                # try to pick first string value
-                for v in data.values():
-                    if isinstance(v, str) and "{" in v:
-                        resp_text = v
-                        break
-        if not resp_text:
-            # If response isn't in JSON, try text
-            resp_text = r.text
-        parsed = extract_json_substring(resp_text)
+        content = data["choices"][0]["message"]["content"]
+        parsed = extract_json_substring(content)
         return parsed
-    except Exception as e:
-        print("Ollama summarization failed:", e)
+    except Exception as ex:
+        print("Groq parse error:", ex)
         return None
 
-# ---------------- OpenAI summarization (optional) ----------------
+# ---------------- OpenAI fallback (optional) ----------------
 def openai_summarize(openai_key, title, text, url):
-    """Call OpenAI (new client) to produce the same strict JSON. Returns dict or None."""
+    if not openai_key:
+        return None
     try:
         from openai import OpenAI
     except Exception as e:
@@ -216,39 +211,48 @@ def openai_summarize(openai_key, title, text, url):
         return None
     client = OpenAI(api_key=openai_key)
     prompt = f"""
-You are an editor preparing concise Drishti/InsightsonIndia-style current affairs notes for UPSC.
-Given the article title, URL and article text, produce ONLY a JSON object with keys:
+You are a UPSC editor. Return strict JSON only with keys:
 include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
 
-Article Title: {title}
-Article URL: {url}
-Article text (trimmed): {text[:3500]}
-
-Keep fields concise. Output valid JSON only.
+Title: {title}
+URL: {url}
+Text (trimmed): {text[:3500]}
 """
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             max_tokens=700,
             temperature=0.0
         )
         raw = resp.choices[0].message["content"]
         parsed = extract_json_substring(raw)
-        if parsed:
-            return parsed
-        # try direct parse
-        try:
-            return json.loads(raw)
-        except Exception:
-            return None
+        return parsed
     except Exception as ex:
-        print("OpenAI API call failed:", ex)
+        print("OpenAI error:", ex)
         return None
+
+# ---------------- Offline fallback ----------------
+def offline_summary_fallback(title, text, url):
+    sents = [s.strip() for s in re.split(r'\.|\n', text) if len(s.strip())>40]
+    context = sents[0] if sents else title
+    background = " ".join(sents[1:3]) if len(sents)>1 else ""
+    key_points = sents[1:5] if len(sents)>1 else [title]
+    return {
+        "include":"yes",
+        "category":"Misc",
+        "section_heading": title[:100],
+        "context": context[:600],
+        "background": background[:800],
+        "key_points": key_points[:5],
+        "impact": "",
+        "upsc_relevance": "General current affairs",
+        "source": url,
+        "image_bytes": None
+    }
 
 # ---------------- PDF generation ----------------
 def build_pdf(structured_items, pdf_path):
-    # imports here so script can run even if reportlab missing until workflow installs it
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
@@ -284,7 +288,6 @@ def build_pdf(structured_items, pdf_path):
         content.append(Paragraph(cat, styles['Section']))
         for it in items:
             content.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles['Body']))
-            # image
             imgb = it.get('image_bytes')
             if imgb:
                 try:
@@ -311,10 +314,10 @@ def build_pdf(structured_items, pdf_path):
             content.append(Spacer(1,10))
         content.append(Spacer(1,6))
 
-    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original source and official releases (PIB/The Hindu)", styles['Meta']))
+    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original source and official releases (PIB/The Hindu).", styles['Meta']))
     doc.build(content)
 
-# ---------------- Email ----------------
+# ---------------- EMAIL ----------------
 def email_pdf(pdf_path):
     SMTP_USER = os.environ.get("SMTP_USER")
     SMTP_PASS = os.environ.get("SMTP_PASSWORD")
@@ -344,8 +347,7 @@ def email_pdf(pdf_path):
 # ---------------- MAIN FLOW ----------------
 def main():
     import feedparser
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    # gather candidates
+    openai_key = OPENAI_API_KEY
     entries = []
     for feed in RSS_FEEDS:
         try:
@@ -355,8 +357,8 @@ def main():
         except Exception as ex:
             print("Feed error", feed, ex)
 
-    # dedupe and limit
-    seen = set(); candidates = []
+    seen = set()
+    candidates = []
     for e in entries:
         if e["link"] in seen: continue
         seen.add(e["link"])
@@ -377,57 +379,67 @@ def main():
             continue
 
         parsed = None
-        # 1) Try OpenAI if key provided (preferred), fallback to Ollama
-        if openai_key:
+        # 1) Try Groq first
+        parsed = groq_summarize(title, text, link)
+        if parsed is None and openai_key:
+            print("Groq failed or returned nothing; trying OpenAI fallback.")
             parsed = openai_summarize(openai_key, title, text, link)
-            if parsed is None:
-                print("OpenAI failed or returned no valid parse; falling back to Ollama.")
+
         if parsed is None:
-            parsed = ollama_summarize(title, text, link)
+            print("Both Groq/OpenAI failed; using offline fallback for this article.")
+            parsed = offline_summary_fallback(title, text, link)
 
         if not parsed:
-            print(" -> no parsed JSON from models; skipping.")
+            print(" -> no parsed JSON available, skipping")
             continue
 
-        # ensure include
-        inc = str(parsed.get("include","no")).lower()
-        if inc != "yes":
+        # ensure include is present (offline fallback sets include=yes)
+        if str(parsed.get("include","yes")).lower() != "yes":
             print(" -> model marked not relevant; skipping.")
             continue
 
-        # Attach image bytes and normalize fields
+        # attach image bytes (may be None)
         parsed["image_bytes"] = img_bytes
         parsed.setdefault("key_points", [])
         parsed.setdefault("background", "")
         parsed.setdefault("impact", "")
         parsed.setdefault("upsc_relevance", "")
         parsed.setdefault("source", link)
-        # normalize key_points from string to list if needed
+
+        # normalize key_points to list
         kp = parsed.get("key_points", [])
         if isinstance(kp, str):
-            # split heuristically on line breaks or semicolons or full stops
-            kp_list = [s.strip() for s in re.split(r'[\\r\\n;•\\-]+', kp) if s.strip()]
+            kp_list = [s.strip() for s in re.split(r'[\r\n;•\-]+', kp) if s.strip()]
             parsed["key_points"] = kp_list[:5]
+
         structured.append(parsed)
         included += 1
         print(f" -> included (category: {parsed.get('category')})")
-        time.sleep(1.0)  # polite pause
+        time.sleep(1.0)
 
     if not structured:
-        print("No UPSC-relevant items found today. (You can relax filter or add more UPSC feeds.)")
-        # optional fallback behaviour: uncomment to force delivery of top headlines
-        # for c in candidates[:3]:
-        #     structured.append({
-        #         "category":"Misc", "section_heading":c['title'], "context":"Auto-added headline for testing.",
-        #         "background":"", "key_points":[c['title']], "impact":"", "upsc_relevance":"",
-        #         "source":c['link'], "image_bytes":None})
-        # if not structured: return
+        print("No UPSC-relevant items found; generating a minimal fallback PDF.")
+        # minimal fallback: take top 3 headlines
+        for c in candidates[:3]:
+            structured.append({
+                "category":"Misc",
+                "section_heading": c.get("title",""),
+                "context": "Auto-added headline — no AI summary available today.",
+                "background": "",
+                "key_points": [c.get("title","")],
+                "impact": "",
+                "upsc_relevance": "",
+                "source": c.get("link",""),
+                "image_bytes": None
+            })
 
-    # build PDF & email
     pdf_name = f"UPSC_AI_Brief_{datetime.date.today().isoformat()}.pdf"
     build_pdf(structured, pdf_name)
     print("PDF created:", pdf_name)
-    email_pdf(pdf_name)
+    try:
+        email_pdf(pdf_name)
+    except Exception as ex:
+        print("Email sending failed:", ex)
 
 if __name__ == "__main__":
     main()
