@@ -1,45 +1,41 @@
 #!/usr/bin/env python3
 """
-generate_and_send.py
+generate_and_send.py — improved PDF layout + stronger content enforcement
 
-Final UPSC Daily Brief generator (improved).
-- Strong model prompt for structured Output: context, about, facts_and_policies,
-  sub_sections (heading+points), impact_or_analysis, upsc_relevance.
-- If model omits facts/policies, offline extractor creates them from text.
-- Groups items by GS category and prints header-level UPSC label.
-- Builds PDF in InsightsIAS-style layout and emails it.
+Revisions:
+- PDF layout: uses KeepTogether and ListFlowable/ListItem for consistent card layout,
+  two-column (text left, image right) without overflowing table cells.
+- Content: model prompt now requests 'detailed_brief' and 'policy_points'; offline
+  enrichment ensures minimum lengths for 'about' and 'detailed_brief'.
+- Other features: boilerplate filter, India relevance, Groq/OpenAI fallback, email.
 """
 
-import os
-import re
-import io
-import json
-import time
-import ssl
-import smtplib
-import datetime
-import requests
-import feedparser
+import os, re, io, json, time, ssl, smtplib, datetime, requests, feedparser
 from email.message import EmailMessage
 
+# PDF / imaging
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage,
+    KeepTogether, ListFlowable, ListItem, PageBreak
+)
 from reportlab.lib import colors
 from reportlab.lib.units import mm
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
-# ----------------- CONFIG -----------------
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "mixtral-8x7b")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+# ---------------- CONFIG ----------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "mixtral-8x7b")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-EMAIL_TO = os.environ.get("EMAIL_TO")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+EMAIL_TO = os.getenv("EMAIL_TO")
 
 PDF_FILENAME = f"UPSC_AI_Brief_{datetime.date.today().isoformat()}.pdf"
 
@@ -76,7 +72,7 @@ CATEGORY_LABELS = {
     "Misc": "Miscellaneous Current Affairs"
 }
 
-# ----------------- Utilities -----------------
+# ---------------- Helpers ----------------
 def safe_trim(text, max_chars=3800):
     if not text:
         return ""
@@ -105,7 +101,7 @@ def clean_text(raw):
 
 def is_boilerplate(title, text):
     c = (title + " " + text).lower()
-    patterns = ["upsc current affairs", "instalinks", "covers important current affairs of the day", "gs paper", "content for mains enrichment"]
+    patterns = ["upsc current affairs", "instalinks", "think beyond the current affairs", "covers important current affairs", "gs paper"]
     return sum(1 for p in patterns if p in c) >= 2
 
 def is_india_relevant(title, text, url):
@@ -136,7 +132,7 @@ def extract_json_substring(s):
                     return None
     return None
 
-# ----------------- Article extractor -----------------
+# --------------- extraction ----------------
 def extract_article_text_and_image(url, timeout=12):
     headers = {"User-Agent":"Mozilla/5.0"}
     try:
@@ -157,15 +153,15 @@ def extract_article_text_and_image(url, timeout=12):
             return text, img_bytes
     except Exception:
         pass
-
+    # readability fallback
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
         from readability import Document
         doc = Document(r.text)
         summary_html = doc.summary()
         text = clean_text(re.sub(r'<[^>]+>', ' ', summary_html))
-        img_bytes = None
         m = re.search(r'property=["\']og:image["\'] content=["\']([^"\']+)["\']', r.text, flags=re.I)
+        img_bytes = None
         if m:
             try:
                 r2 = requests.get(m.group(1), timeout=timeout, headers=headers)
@@ -177,15 +173,15 @@ def extract_article_text_and_image(url, timeout=12):
             return text, img_bytes
     except Exception:
         pass
-
+    # simple fallback
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
         html = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', ' ', r.text)
         stripped = re.sub(r'<[^>]+>', ' ', html)
         stripped = ' '.join(stripped.split())
         text = clean_text(stripped)
-        img_bytes = None
         m = re.search(r'property=["\']og:image["\'] content=["\']([^"\']+)["\']', r.text, flags=re.I)
+        img_bytes = None
         if m:
             try:
                 r2 = requests.get(m.group(1), timeout=timeout, headers=headers)
@@ -195,172 +191,163 @@ def extract_article_text_and_image(url, timeout=12):
                 img_bytes = None
         if text and len(text.split())>60:
             return text, img_bytes
-    except Exception:
+    except:
         pass
-
     return "", None
 
-# ----------------- Model calls -----------------
-def call_api_json_groq(prompt, max_tokens=1200):
-    if not GROQ_API_KEY:
-        return None
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type":"application/json"}
-    payload = {"model": GROQ_MODEL, "messages":[{"role":"user","content":prompt}], "temperature":0.0, "max_tokens": max_tokens}
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=60)
-        if r.status_code==200:
-            content = r.json()["choices"][0]["message"]["content"]
-            return extract_json_substring(content)
-    except Exception as e:
-        print("groq error:", e)
-    return None
-
-def call_api_json_openai(prompt, max_tokens=1200):
-    if not OPENAI_API_KEY:
-        return None
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
-    payload = {"model": OPENAI_MODEL, "messages":[{"role":"user","content":prompt}], "temperature":0.0, "max_tokens": max_tokens}
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=60)
-        if r.status_code==200:
-            content = r.json()["choices"][0]["message"]["content"]
-            return extract_json_substring(content)
-    except Exception as e:
-        print("openai error:", e)
+# --------------- Model calls ----------------
+def call_model(prompt, use_groq=True, max_tokens=1200):
+    # try groq
+    if use_groq and GROQ_API_KEY:
+        try:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type":"application/json"}
+            payload = {"model":GROQ_MODEL, "messages":[{"role":"user","content":prompt}], "temperature":0.0, "max_tokens":max_tokens}
+            r = requests.post(url, json=payload, headers=headers, timeout=60)
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"]
+                parsed = extract_json_substring(content)
+                if parsed: return parsed
+        except Exception as e:
+            print("groq error", e)
+    # fallback openai
+    if OPENAI_API_KEY:
+        try:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
+            payload = {"model":OPENAI_MODEL, "messages":[{"role":"user","content":prompt}], "temperature":0.0, "max_tokens":max_tokens}
+            r = requests.post(url, json=payload, headers=headers, timeout=60)
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"]
+                parsed = extract_json_substring(content)
+                if parsed: return parsed
+        except Exception as e:
+            print("openai error", e)
     return None
 
 def summarize_via_model(title, url, text):
     trimmed = safe_trim(text, max_chars=3800)
     prompt = f"""
-You are an expert UPSC analyst producing InsightsIAS-style current affairs notes.
+You are an expert UPSC analyst writing InsightsIAS-style notes.
 Return STRICT valid JSON only in this format:
 
 {{
-  "include": "yes/no",
-  "category": "GS1/GS2/GS3/GS4/CME/Mapping/FFP",
-  "section_heading": "",
-  "context": "",
-  "about": "",
+  "include":"yes/no",
+  "category":"GS1/GS2/GS3/GS4/CME/Mapping/FFP",
+  "section_heading":"",
+  "context":"",
+  "about":"",
   "facts_and_policies": [],
-  "sub_sections": [ {{ "heading": "", "points": [] }} ],
+  "policy_points": [],          # concise policy/scheme/act bullets
+  "detailed_brief": "",         # 120-220 words paragraph
+  "sub_sections": [ {{ "heading":"", "points": [] }} ],
   "impact_or_analysis": [],
-  "upsc_relevance": ""
+  "upsc_relevance":""
 }}
 
 Guidelines:
-- Provide concrete factual bullets (scheme names, ministry names, report titles, data, years, percentages) in facts_and_policies.
-- If policy provisions / acts / rules apply, include under sub_sections (heading + points).
-- Keep bullets short (6-16 words) and factual.
-- If the article text is truncated, set context to "SOURCE_ONLY".
+- Put 3-6 factual bullets (schemes, ministries, reports, years, numbers) in facts_and_policies.
+- If policy or legal provisions exist, list them in policy_points and/or sub_sections.
+- Provide a 'detailed_brief' paragraph (120-220 words) synthesizing causes, facts and implications for UPSC.
+- If article is truncated, set context to "SOURCE_ONLY".
 - Do not invent facts.
 
 Title: {title}
 URL: {url}
 Article Text: {trimmed}
 """
-    parsed = None
-    if GROQ_API_KEY:
-        parsed = call_api_json_groq(prompt)
-    if parsed is None and OPENAI_API_KEY:
-        parsed = call_api_json_openai(prompt)
-    return parsed
+    return call_model(prompt)
 
-# ------------- Offline fact & policy extractor -------------
+# --------------- offline extraction helpers ---------------
 FACT_PATTERNS = [
-    r'(\b\d{4}\b)',                                   # years
-    r'(\b\d+%|\b\d+\.\d+%|\b\d+ per cent\b)',        # percentages
-    r'(\b\d{1,3}(,\d{3})+\b|\b\d+\b)',                # numbers with commas or plain numbers
-    r'((?:Ministry|Department|Ministries|Council|Commission)\s+of\s+[A-Z][a-zA-Z]+)', # Ministry of X
-    r'([A-Z][a-z]+\s+Scheme|Scheme\s+for|Programme|Program|Act\b|Bill\b|Policy\b|Index\b|Report\b)',
-    r'\b(UN|UNEP|WHO|IMF|World Bank|KAUST|ICMR|ISRO|NITI Aayog|NITI-Aayog|NITI)\b',
+    r'\b\d{4}\b', r'\b\d+%|\d+\.\d+%', r'\b\d{1,3}(?:,\d{3})+\b', r'\b(ICMR|ISRO|NITI Aayog|WHO|World Bank|UN|KAUST|IMF)\b',
+    r'\b(Ministry of|Department of|Scheme|Policy|Act|Bill|programme|program)\b', r'\b(report|index|survey)\b'
 ]
 
 def extract_facts_from_text(text, max_bullets=6):
-    bullets = []
+    bullets=[]
     sentences = re.split(r'(?<=[\.\?\!])\s+', text)
-    seen = set()
-    # ranking sentences by matches of patterns
-    scored = []
+    scored=[]
     for s in sentences:
-        score = 0
-        lower = s.lower()
+        score=0
         for pat in FACT_PATTERNS:
-            if re.search(pat, s):
-                score += 1
+            if re.search(pat, s, flags=re.I):
+                score+=1
         if score>0:
             scored.append((score, s.strip()))
     scored.sort(key=lambda x: x[0], reverse=True)
+    seen=set()
     for _, s in scored:
-        # shorten sentence into a bullet: if contains colon split keep second part
-        bullet = s.strip()
-        bullet = re.sub(r'\s+', ' ', bullet)
-        if len(bullet) > 180:
-            bullet = bullet[:180].rsplit(' ',1)[0] + '...'
-        if bullet not in seen:
-            bullets.append(bullet)
-            seen.add(bullet)
-        if len(bullets) >= max_bullets:
-            break
-    # fallback: try to pick numeric facts if none found
+        b = re.sub(r'\s+', ' ', s)
+        if len(b)>200: b = b[:200].rsplit(' ',1)[0]+'...'
+        if b not in seen:
+            bullets.append(b)
+            seen.add(b)
+        if len(bullets)>=max_bullets: break
     if not bullets:
         nums = re.findall(r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?%?', text)
         for n in nums[:max_bullets]:
-            if n not in seen:
-                bullets.append(f"Figure: {n}")
-                seen.add(n)
+            bullets.append(f"Figure: {n}")
     return bullets
 
-def extract_policy_mentions(text, max_items=4):
-    pts = []
+def extract_policy_points(text, max_items=4):
+    pts=[]
     sentences = re.split(r'(?<=[\.\?\!])\s+', text)
     for s in sentences:
-        if re.search(r'\b(Ministry|Department|Policy|Scheme|Act|Bill|Programme|Program|NITI Aayog|PM|Prime Minister)\b', s, flags=re.I):
+        if re.search(r'\b(Ministry|Department|Policy|Scheme|Act|Bill|NITI Aayog|PM|Prime Minister)\b', s, flags=re.I):
             p = re.sub(r'\s+', ' ', s.strip())
-            if len(p) > 200:
-                p = p[:200].rsplit(' ',1)[0] + '...'
+            if len(p)>200: p = p[:200].rsplit(' ',1)[0]+'...'
             if p not in pts:
                 pts.append(p)
-        if len(pts) >= max_items:
-            break
+        if len(pts)>=max_items: break
     return pts
 
-# -------------- Validation & enrichment --------------
-def parsed_is_good(parsed):
+# --------------- validation & enrichment ---------------
+def parsed_needs_enrichment(parsed):
     if not parsed:
-        return False
-    inc = str(parsed.get("include","yes")).lower()
-    if inc != "yes":
         return True
-    ctx = (parsed.get("context","") or "").strip()
-    if ctx.upper() == "SOURCE_ONLY":
-        return True
-    facts = parsed.get("facts_and_policies", []) or []
-    # require at least one meaningful fact
-    if any(len(f.strip())>8 for f in facts):
+    facts = parsed.get("facts_and_policies") or []
+    detailed = (parsed.get("detailed_brief") or "").strip()
+    about = (parsed.get("about") or "").strip()
+    # require at least 2 facts and a detailed_brief > 80 chars
+    if len([f for f in facts if len(f.strip())>8]) < 2 or len(detailed) < 80 or len(about) < 40:
         return True
     return False
 
-def enrich_parsed_with_offline(parsed, text):
+def enrich_parsed(parsed, text, title):
     if parsed is None:
-        parsed = {}
+        parsed = {"section_heading": title, "facts_and_policies": [], "policy_points": [], "sub_sections": [], "impact_or_analysis": [], "about": "", "detailed_brief": ""}
+    # fill facts if missing
     facts = parsed.get("facts_and_policies", []) or []
-    policies = parsed.get("sub_sections", []) or []
-    if not facts or not any(len(f.strip())>8 for f in facts):
-        ext_facts = extract_facts_from_text(text, max_bullets=6)
-        if ext_facts:
-            parsed["facts_and_policies"] = ext_facts
-    # add policy mentions into sub_sections if missing
-    has_policy_section = any(s.get("heading","").lower().startswith("key provision") or "policy" in s.get("heading","").lower() for s in policies)
-    if not has_policy_section:
-        pm = extract_policy_mentions(text, max_items=4)
-        if pm:
-            policies.append({"heading":"Key Provisions / Policy Mentions", "points": pm})
-    parsed["sub_sections"] = policies
+    if len([f for f in facts if len(f.strip())>8]) < 2:
+        ext = extract_facts_from_text(text, max_bullets=6)
+        parsed["facts_and_policies"] = (facts + ext)[:6]
+    # fill policy_points
+    ppts = parsed.get("policy_points", []) or []
+    if not ppts:
+        ppts = extract_policy_points(text, max_items=4)
+        parsed["policy_points"] = ppts
+        if ppts:
+            subs = parsed.get("sub_sections", []) or []
+            subs.append({"heading":"Key Provisions / Policy Mentions","points": ppts})
+            parsed["sub_sections"] = subs
+    # generate a short detailed_brief if still missing using a lightweight template
+    if not parsed.get("detailed_brief") or len(parsed.get("detailed_brief","").strip()) < 80:
+        sb = []
+        if parsed.get("about"):
+            sb.append(parsed["about"])
+        sb.extend(parsed.get("facts_and_policies",[])[:3])
+        brief = " ".join(sb)
+        # keep brief concise if long
+        if len(brief) < 120:
+            # expand by joining a couple more facts
+            brief = brief + " " + " ".join(parsed.get("policy_points",[])[:2])
+        if len(brief) < 80:
+            brief = (parsed.get("section_heading","") + ". ") + brief
+        parsed["detailed_brief"] = brief[:800]
     return parsed
 
-# -------------- Category scoring --------------
+# --------------- category scoring ---------------
 def score_category(title, text):
     combined = (title + " " + text).lower()
     scores = {k:0 for k in CATEGORY_KEYWORDS}
@@ -368,11 +355,11 @@ def score_category(title, text):
         for kw in kws:
             scores[cat] += combined.count(kw)
     best = max(scores.items(), key=lambda kv: kv[1])
-    if best[1] == 0:
+    if best[1]==0:
         return "Misc"
     return best[0]
 
-# -------------- Logo generator --------------
+# --------------- logo ---------------
 def generate_logo_bytes(text="DailyCAThroughAI", size=(420,80), bgcolor=(31,78,121), fg=(255,255,255)):
     try:
         img = PILImage.new("RGB", size, bgcolor)
@@ -391,16 +378,16 @@ def generate_logo_bytes(text="DailyCAThroughAI", size=(420,80), bgcolor=(31,78,1
         bio = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
         return bio.read()
     except Exception as e:
-        print("logo error", e)
-        return None
+        print("logo error", e); return None
 
-# -------------- PDF builder --------------
+# --------------- PDF builder (improved) ---------------
 def build_pdf(structured_items, out_path):
     doc = SimpleDocTemplate(out_path, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="CardTitle", fontSize=12, leading=14, spaceAfter=4))
     styles.add(ParagraphStyle(name="CardBody", fontSize=10, leading=13))
     styles.add(ParagraphStyle(name="SectionHeader", fontSize=13, leading=15, textColor=colors.HexColor("#1f4e79"), spaceBefore=8, spaceAfter=6))
+    styles.add(ParagraphStyle(name="CenteredSmall", fontSize=9, leading=11, alignment=TA_CENTER, textColor=colors.grey))
 
     story = []
     today_str = datetime.datetime.now().strftime("%d %B %Y")
@@ -408,72 +395,93 @@ def build_pdf(structured_items, out_path):
     left_elem = RLImage(io.BytesIO(logo_bytes), width=110, height=28) if logo_bytes else Paragraph("DailyCAThroughAI", styles["CardBody"])
     right_elem = Paragraph(f"<b>UPSC CURRENT AFFAIRS</b><br/>{today_str}", styles["CardTitle"])
     header_table = Table([[left_elem, right_elem]], colWidths=[120, doc.width-120])
-    header_table.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),("BACKGROUND",(0,0),(-1,-1), colors.HexColor("#f4f8fb")),("LEFTPADDING",(0,0),(-1,-1),8)]))
+    header_table.setStyle(TableStyle([("VALIGN",(0,0),(-1,-1),"MIDDLE"),("BACKGROUND",(0,0),(-1,-1), colors.HexColor("#f4f8fb")),("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8)]))
     story.append(header_table); story.append(Spacer(1,8))
 
-    grouped = {}
+    # group by category and keep order
+    order = ["GS1","GS2","GS3","GS4","CME","FFP","Mapping","Misc"]
+    grouped = {c:[] for c in order}
     for it in structured_items:
         cat = it.get("category","Misc")
-        grouped.setdefault(cat, []).append(it)
+        if cat not in grouped: grouped["Misc"].append(it)
+        else: grouped[cat].append(it)
 
-    # order
-    order = ["GS1","GS2","GS3","GS4","CME","FFP","Mapping","Misc"]
     for cat in order:
         items = grouped.get(cat, [])
         if not items:
             continue
-        story.append(Paragraph(CATEGORY_LABELS.get(cat, cat), styles["SectionHeader"]))
+        # section header with friendly label
+        label = CATEGORY_LABELS.get(cat, cat)
+        story.append(Paragraph(label, styles["SectionHeader"]))
         story.append(Spacer(1,6))
 
         for it in items:
-            parts = []
+            # Build left column flowables
+            left_flow = []
             title = it.get("section_heading","Untitled")
-            parts.append(Paragraph(f"<b>{title}</b>", styles["CardTitle"]))
-            ctx = it.get("context","")
-            if ctx:
-                parts.append(Paragraph(f"<b>Context:</b> {ctx}", styles["CardBody"]))
-            about = it.get("about","")
-            if about:
-                parts.append(Paragraph(f"<b>About:</b> {about}", styles["CardBody"]))
+            left_flow.append(Paragraph(f"<b>{title}</b>", styles["CardTitle"]))
+            if it.get("context"):
+                left_flow.append(Paragraph(f"<b>Context:</b> {it['context']}", styles["CardBody"]))
+            if it.get("about"):
+                left_flow.append(Paragraph(f"<b>About:</b> {it['about']}", styles["CardBody"]))
 
-            facts = it.get("facts_and_policies", []) or []
+            facts = it.get("facts_and_policies",[]) or []
             if facts:
-                parts.append(Paragraph("<b>Facts & Data:</b>", styles["CardBody"]))
-                for f in facts:
-                    parts.append(Paragraph(f"• {f}", styles["CardBody"]))
+                left_flow.append(Paragraph("<b>Facts & Data:</b>", styles["CardBody"]))
+                # use ListFlowable for bullets to ensure proper indentation & wrapping
+                bullets = [ListItem(Paragraph(f, styles["CardBody"]), leftIndent=6) for f in facts]
+                left_flow.append(ListFlowable(bullets, bulletType='bullet', start='•', leftIndent=8))
 
-            subs = it.get("sub_sections", []) or []
+            policy_pts = it.get("policy_points", []) or []
+            subs = it.get("sub_sections",[]) or []
+            # include sub_sections too
             for s in subs:
                 head = s.get("heading","")
                 pts = s.get("points",[]) or []
                 if head:
-                    parts.append(Spacer(1,4))
-                    parts.append(Paragraph(f"<b>{head}:</b>", styles["CardBody"]))
-                for p in pts:
-                    parts.append(Paragraph(f"• {p}", styles["CardBody"]))
+                    left_flow.append(Spacer(1,4))
+                    left_flow.append(Paragraph(f"<b>{head}:</b>", styles["CardBody"]))
+                    bullets = [ListItem(Paragraph(p, styles["CardBody"]), leftIndent=6) for p in pts]
+                    left_flow.append(ListFlowable(bullets, bulletType='bullet', leftIndent=8))
+
+            if policy_pts and not subs:
+                left_flow.append(Paragraph("<b>Policy / Provisions:</b>", styles["CardBody"]))
+                bullets = [ListItem(Paragraph(p, styles["CardBody"]), leftIndent=6) for p in policy_pts]
+                left_flow.append(ListFlowable(bullets, bulletType='bullet', leftIndent=8))
+
+            detailed = it.get("detailed_brief","")
+            if detailed:
+                left_flow.append(Spacer(1,4))
+                left_flow.append(Paragraph(f"<b>Detailed Brief:</b> {detailed}", styles["CardBody"]))
 
             impact = it.get("impact_or_analysis",[]) or []
             if impact:
-                parts.append(Paragraph("<b>Impact / Analysis:</b>", styles["CardBody"]))
-                for im in impact:
-                    parts.append(Paragraph(f"• {im}", styles["CardBody"]))
+                left_flow.append(Spacer(1,4))
+                left_flow.append(Paragraph("<b>Impact / Analysis:</b>", styles["CardBody"]))
+                bullets = [ListItem(Paragraph(p, styles["CardBody"]), leftIndent=6) for p in impact]
+                left_flow.append(ListFlowable(bullets, bulletType='bullet', leftIndent=8))
 
-            # image on right if available
+            # KeepTogether ensures the left flow stays intact in page breaks where feasible
+            left_block = KeepTogether(left_flow)
+
+            # prepare right image if any
             img_elem = None
             im_bytes = it.get("image_bytes")
             if im_bytes:
                 try:
                     pil = PILImage.open(io.BytesIO(im_bytes))
                     pil.thumbnail((150,100))
-                    bb = io.BytesIO(); pil.save(bb, format="PNG"); bb.seek(0)
+                    bb = io.BytesIO(); pil.save(bb, format='PNG'); bb.seek(0)
                     img_elem = RLImage(bb, width=min(140,pil.width), height=min(100,pil.height))
-                except:
+                except Exception:
                     img_elem = None
+
+            # Build a 2-col table: left_block and optional image. If no image, single column
             try:
                 if img_elem:
-                    tbl = Table([[parts, img_elem]], colWidths=[doc.width*0.66, doc.width*0.34])
+                    tbl = Table([[left_block, img_elem]], colWidths=[doc.width*0.68, doc.width*0.32])
                 else:
-                    tbl = Table([[parts]], colWidths=[doc.width])
+                    tbl = Table([[left_block]], colWidths=[doc.width])
                 tbl.setStyle(TableStyle([
                     ("BOX",(0,0),(-1,-1),0.5, colors.HexColor("#cfdff0")),
                     ("LEFTPADDING",(0,0),(-1,-1),8),
@@ -483,16 +491,21 @@ def build_pdf(structured_items, out_path):
                 ]))
                 story.append(tbl)
             except Exception as e:
-                for p in parts:
-                    story.append(p)
+                # fallback: append left_block alone
+                story.append(left_block)
+                story.append(Spacer(1,4))
             story.append(Spacer(1,10))
 
-    story.append(Paragraph("Note: Summaries auto-generated; verify facts from original sources if needed.", ParagraphStyle(name="note", fontSize=8, textColor=colors.grey)))
+    # footer
+    note_style = ParagraphStyle("note", fontSize=8, textColor=colors.grey, alignment=TA_LEFT)
+    story.append(Paragraph("Note: Summaries auto-generated. Verify facts from original sources if needed.", note_style))
+    # build
     try:
         doc.build(story)
-        return out_path
+        return out_path if (out_path:=out_path) else out_path
     except Exception as e:
-        print("PDF build failed:", e)
+        print("PDF build error:", e)
+        # minimal fallback
         try:
             from reportlab.pdfgen import canvas
             c = canvas.Canvas(out_path, pagesize=A4)
@@ -503,22 +516,20 @@ def build_pdf(structured_items, out_path):
             c.save()
             return out_path
         except Exception as e2:
-            print("PDF fallback failed", e2)
+            print("Minimal fallback failed:", e2)
             return None
 
-# ----------------- Email -----------------
+# ---------------- email ----------------
 def email_pdf_file(path):
     if not SMTP_USER or not SMTP_PASSWORD or not EMAIL_TO:
-        raise EnvironmentError("SMTP_USER / SMTP_PASSWORD / EMAIL_TO must be set as env vars")
+        raise EnvironmentError("Set SMTP_USER / SMTP_PASSWORD / EMAIL_TO")
     msg = EmailMessage()
     msg["Subject"] = f"UPSC AI Brief — {datetime.date.today().strftime('%d %b %Y')}"
     msg["From"] = SMTP_USER
     msg["To"] = EMAIL_TO
     msg.set_content("Attached: UPSC AI Current Affairs Brief (auto-generated).")
-
     with open(path, "rb") as f:
         msg.add_attachment(f.read(), maintype="application", subtype="pdf", filename=os.path.basename(path))
-
     ctx = ssl.create_default_context()
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
         s.starttls(context=ctx)
@@ -526,14 +537,15 @@ def email_pdf_file(path):
         s.send_message(msg)
     print("Email sent to", EMAIL_TO)
 
-# --------------- Main pipeline -----------------
+# -------------- main pipeline ----------------
 def main():
-    print("Start generating:", datetime.datetime.utcnow().isoformat())
-    candidates = []
+    print("Start:", datetime.datetime.utcnow().isoformat())
+    # collect RSS
+    candidates=[]
     for feed in RSS_FEEDS:
         try:
             parsed = feedparser.parse(feed)
-            for entry in parsed.entries[:15]:
+            for entry in parsed.entries[:12]:
                 title = entry.get("title",""); link = entry.get("link","")
                 if title and link:
                     candidates.append({"title":title, "link":link})
@@ -541,88 +553,75 @@ def main():
                     break
         except Exception as e:
             print("feed error", feed, e)
-    print("Collected candidates:", len(candidates))
+    print("Candidates:", len(candidates))
 
-    structured = []
-    seen = set()
-    included = 0
+    structured=[]
+    seen=set(); included=0
     for c in candidates:
-        if included >= MAX_INCLUSIONS:
-            break
+        if included >= MAX_INCLUSIONS: break
         title = c["title"].strip(); link = c["link"]
-        if link in seen:
-            continue
+        if link in seen: continue
         seen.add(link)
         print("Processing:", title)
-        text, img = extract_article_text_and_image(link)
+        text,img = extract_article_text_and_image(link)
         if not text:
-            print(" -> no text")
-            continue
+            print(" -> no text, skip"); continue
         if is_boilerplate(title, text):
-            print(" -> boilerplate skipped")
-            continue
+            print(" -> boilerplate skip"); continue
         if not is_india_relevant(title, text, link):
-            print(" -> skipped not India-relevant")
-            continue
+            print(" -> not India-relevant skip"); continue
 
         parsed = summarize_via_model(title, link, text)
         if parsed is None:
-            # basic fallback structure
+            # fallback structure
             sents = [s.strip() for s in re.split(r'\.|\n', text) if len(s.strip())>40]
             parsed = {
-                "include":"yes",
-                "category":"",
-                "section_heading": title,
+                "include":"yes","category":"","section_heading":title,
                 "context": sents[0] if sents else title,
                 "about": " ".join(sents[1:3]) if len(sents)>1 else "",
-                "facts_and_policies": [],
-                "sub_sections": [],
-                "impact_or_analysis": [],
-                "upsc_relevance":""
+                "facts_and_policies": [], "policy_points": [], "detailed_brief":"",
+                "sub_sections": [], "impact_or_analysis": [], "upsc_relevance":""
             }
 
-        # If parsed lacks facts or looks truncated, enrich offline
-        if not parsed_is_good(parsed):
-            print(" -> parsed lacks facts; enriching offline")
-            parsed = enrich_parsed_with_offline(parsed, text)
+        # enrichment if needed
+        if parsed_needs_enrichment(parsed):
+            print(" -> enriching parsed content offline")
+            parsed = enrich_parsed(parsed, text, title)
 
-        # final safety: ensure some facts exist
+        # ensure minimal facts
         if not parsed.get("facts_and_policies"):
             parsed["facts_and_policies"] = extract_facts_from_text(text, max_bullets=5)
 
-        # category
+        # category mapping
         cat = parsed.get("category","") or ""
         if cat:
             m = re.search(r'gs\s*([1-4])', str(cat), flags=re.I)
-            if m:
-                category = f"GS{m.group(1)}"
-            else:
-                category = cat
+            if m: category = f"GS{m.group(1)}"
+            else: category = cat
         else:
             category = score_category(title, text)
         if category not in CATEGORY_LABELS:
             category = "Misc"
         parsed["category"] = category
 
-        # attach image
         parsed["image_bytes"] = img
         parsed.setdefault("sub_sections", [])
         parsed.setdefault("impact_or_analysis", [])
         structured.append(parsed)
         included += 1
-        print(f" -> included as {category}; total {included}")
-        time.sleep(0.7)
+        print(f" -> included as {category} ({included})")
+        time.sleep(0.6)
 
     if not structured:
-        print("No relevant items found; creating minimal placeholder and aborting.")
+        print("No items; abort.")
         return
 
     out_path = PDF_FILENAME
     pdf_created = build_pdf(structured, out_path)
     if not pdf_created:
-        print("PDF creation failed")
+        print("PDF failed")
         return
-    print("PDF created:", out_path)
+    print("PDF:", out_path)
 
     try:
         email_pdf_file(out_path)
