@@ -2,14 +2,11 @@
 """
 generate_and_send.py
 
-UPSC Daily Brief generator — safe_trim + post-parse validation + improved classification.
-
-Features:
-- Groq primary summarization, OpenAI fallback, offline fallback
-- safe_trim to avoid truncating sentences mid-word
-- scoring-based classifier + extended keyword lists (better GS1/GS3 detection)
-- post-parse validation (detect truncated outputs and fallback)
-- robust PDF layout, logo, safe image handling, chunking, email
+Grouped UPSC Daily Brief generator
+- Shows UPSC relevance at section header only
+- Removes per-card UPSC relevance and source display
+- Keeps robust extraction, safe_trim, Groq/OpenAI/offline fallback,
+  safe image handling, chunked PDF layout, logo, email
 """
 
 import os
@@ -30,6 +27,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "mixtral-8x7b")
 
+# UPSC focused feeds
 RSS_FEEDS = [
     "https://www.drishtiias.com/feed",
     "https://www.insightsonindia.com/feed",
@@ -50,7 +48,6 @@ UPSC_KEYWORDS = [
     "study", "research", "index", "survey", "mapping", "geography", "map"
 ]
 
-# Category keywords for scoring classifier (expanded to detect geography/science)
 CATEGORY_KEYWORDS = {
     "GS1": ["tribal", "caste", "society", "population", "culture", "heritage",
             "migration", "demography", "education", "health", "poverty", "geography", "river", "plateau"],
@@ -85,10 +82,8 @@ def clean_extracted_text(raw_text):
     if not raw_text:
         return ""
     text = raw_text.replace("\r", "\n")
-    junk_patterns = [
-        r"SEE ALL NEWSLETTERS", r"e-?Paper", r"ADVERTISEMENT", r"LOGIN", r"Subscribe",
-        r"Related Stories", r"Continue reading", r"Read more", r"Click here"
-    ]
+    junk_patterns = [r"SEE ALL NEWSLETTERS", r"e-?Paper", r"ADVERTISEMENT", r"LOGIN", r"Subscribe",
+                     r"Related Stories", r"Continue reading", r"Read more", r"Click here"]
     for p in junk_patterns:
         text = re.sub(p, " ", text, flags=re.I)
     lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) > 40 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())]
@@ -97,31 +92,21 @@ def clean_extracted_text(raw_text):
     return cleaned.strip()
 
 def safe_trim(text, max_chars=3500):
-    """
-    Trim to max_chars but avoid cutting mid-sentence.
-    Return up to the last period within the window (if reasonably far in),
-    else return the window itself.
-    """
     if not text or len(text) <= max_chars:
         return text
     window = text[:max_chars]
-    # find last sentence end
     last_period = max(window.rfind('.'), window.rfind('!'), window.rfind('?'))
     if last_period and last_period > int(max_chars * 0.6):
         return window[:last_period+1]
-    # fallback: try to break at last newline
     last_nl = window.rfind('\n')
     if last_nl and last_nl > int(max_chars * 0.5):
         return window[:last_nl].rstrip()
-    # final fallback: return window but strip trailing partial word
     if window and window[-1].isalnum():
-        # drop trailing partial token
         return re.sub(r'\s+\S*?$', '', window)
     return window
 
 def extract_article_text_and_image(url, timeout=12):
     headers = {"User-Agent": "Mozilla/5.0"}
-    # newspaper3k
     try:
         from newspaper import Article
         art = Article(url)
@@ -142,7 +127,6 @@ def extract_article_text_and_image(url, timeout=12):
     except Exception:
         pass
 
-    # readability fallback
     try:
         from readability import Document
         r = requests.get(url, timeout=timeout, headers=headers)
@@ -164,7 +148,6 @@ def extract_article_text_and_image(url, timeout=12):
     except Exception:
         pass
 
-    # basic fallback
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
         html = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', ' ', r.text)
@@ -206,7 +189,7 @@ def extract_json_substring(s):
                     return None
     return None
 
-# ---------------- Classification & relevance ----------------
+# ---------------- Classification & relevance helpers ----------------
 def normalize_model_category(cat_str):
     if not cat_str:
         return ""
@@ -237,75 +220,44 @@ def score_category_by_keywords(title, text):
     scores = {cat: 0.0 for cat in CATEGORY_KEYWORDS.keys()}
     for cat, kws in CATEGORY_KEYWORDS.items():
         for kw in kws:
-            # simple occurrence count with small weight for longer keywords
             cnt = combined.count(kw)
             if cnt:
-                scores[cat] += cnt * (1.0 + min(len(kw) / 12.0, 1.5))
+                scores[cat] += cnt * (1.0 + min(len(kw)/12.0, 1.5))
     sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best_cat, best_score = sorted_scores[0]
     if best_score <= 0:
         return "Misc", scores
-    # check closeness to second best
     second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0
     if second_score >= 0.7 * best_score:
         priority = ["GS2", "GS3", "GS1", "GS4", "CME", "FFP", "Mapping", "Misc"]
         for p in priority:
-            if abs(scores.get(p, 0) - best_score) < 1e-6 or scores.get(p, 0) == best_score:
+            if abs(scores.get(p,0) - best_score) < 1e-6 or scores.get(p,0) == best_score:
                 return p, scores
         return best_cat, scores
     return best_cat, scores
 
-def infer_upsc_relevance(parsed, title, text):
-    upsc_rel = (parsed.get("upsc_relevance") or "").strip()
-    if upsc_rel and len(upsc_rel) > 6 and upsc_rel.lower() not in ["general current affairs", "general", "n/a", ""]:
-        return upsc_rel
-    model_cat_norm = normalize_model_category(parsed.get("category", "") or "")
-    if model_cat_norm:
-        if model_cat_norm == "GS1":
-            return "GS1 — Society/Geography"
-        if model_cat_norm == "GS2":
-            return "GS2 — Polity & Governance"
-        if model_cat_norm == "GS3":
-            return "GS3 — Economy/Science/Environment"
-        if model_cat_norm == "GS4":
-            return "GS4 — Ethics"
-        if model_cat_norm == "CME":
-            return "CME — Studies & Reports"
-        if model_cat_norm == "Mapping":
-            return "Mapping — Geography/Location"
-        if model_cat_norm == "FFP":
-            return "FFP — Public Finance"
-    combined = (title + " " + text).lower()
-    for key, (label, kws) in RELEVANCE_KEYWORDS.items():
-        for kw in kws:
-            if kw in combined:
-                return label
-    cat, scores = score_category_by_keywords(title, text)
-    if cat == "GS1":
-        return "GS1 — Society/Geography"
-    if cat == "GS2":
-        return "GS2 — Polity & Governance"
-    if cat == "GS3":
-        return "GS3 — Economy/Science/Environment"
-    if cat == "GS4":
-        return "GS4 — Ethics"
-    if cat == "CME":
-        return "CME — Studies & Reports"
-    if cat == "Mapping":
-        return "Mapping — Geography/Location"
-    if cat == "FFP":
-        return "FFP — Public Finance"
-    return "General Current Affairs"
+def infer_upsc_relevance_label_for_category(cat):
+    # Map canonical category to human-friendly label to show in section header
+    mapping = {
+        "GS1": "GS1 — Society / Geography",
+        "GS2": "GS2 — Polity & Governance",
+        "GS3": "GS3 — Economy / Science / Environment",
+        "GS4": "GS4 — Ethics",
+        "CME": "CME — Studies & Reports",
+        "FFP": "FFP — Public Finance",
+        "Mapping": "Mapping — Geography / Location",
+        "Misc": "Miscellaneous Current Affairs"
+    }
+    return mapping.get(cat, "Current Affairs")
 
-# ---------------- GROQ summarization ----------------
+# ---------------- GROQ / OpenAI / Offline summarizers ----------------
 def call_groq_with_retries(url, headers, payload, attempts=3, backoff=3, timeout=90):
     for i in range(attempts):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             print(f"[groq] attempt {i+1} status {r.status_code}")
-            body_snippet = r.text[:1000].replace("\n", " ")
-            if len(body_snippet) > 0:
-                print("[groq] body_snippet:", body_snippet[:800])
+            body_snippet = r.text[:800].replace("\n", " ")
+            print("[groq] body_snippet:", (body_snippet[:700] + '...') if len(body_snippet)>700 else body_snippet)
             return r
         except Exception as ex:
             print(f"[groq] exception attempt {i+1}:", ex)
@@ -316,7 +268,6 @@ def groq_summarize(title, text, url, timeout=90):
     if not GROQ_API_KEY:
         print("No GROQ_API_KEY found.")
         return None
-    # use safe_trim to avoid sending mid-sentence text to the model
     trimmed = safe_trim(text, max_chars=3500)
     prompt = f"""
 You are a UPSC current-affairs analyst producing InsightsIAS-style notes.
@@ -328,7 +279,7 @@ Article URL: {url}
 Article text (trimmed, keep sentences intact): {trimmed}
 
 Decide include: "yes" if relevant for UPSC (GS papers or FFP/CME/Mapping), otherwise "no".
-Important: do not invent facts. If the article text is incomplete/truncated, state "SOURCE_ONLY" in 'context' and keep other fields empty or minimal, and set include to "yes" if source itself is relevant.
+Important: do not invent facts. If the article text is incomplete/truncated, set context to "SOURCE_ONLY".
 """
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 900}
@@ -337,7 +288,7 @@ Important: do not invent facts. If the article text is incomplete/truncated, sta
         print("Groq: no response after retries.")
         return None
     if r.status_code != 200:
-        print("Groq returned non-200:", r.status_code, getattr(r, "text", "")[:1000])
+        print("Groq returned non-200:", r.status_code)
         return None
     try:
         data = r.json()
@@ -345,10 +296,9 @@ Important: do not invent facts. If the article text is incomplete/truncated, sta
         parsed = extract_json_substring(content)
         return parsed
     except Exception as ex:
-        print("Groq parse error:", ex, getattr(r, "text", "")[:800])
+        print("Groq parse error:", ex)
         return None
 
-# ---------------- OpenAI fallback ----------------
 def openai_summarize(openai_key, title, text, url):
     if not openai_key:
         return None
@@ -367,7 +317,7 @@ Title: {title}
 URL: {url}
 Text (trimmed): {trimmed}
 
-If text seems truncated, set context to "SOURCE_ONLY" and include minimal fields.
+If text seems truncated, set context to "SOURCE_ONLY" and keep other fields minimal.
 """
     try:
         resp = client.chat.completions.create(
@@ -383,7 +333,6 @@ If text seems truncated, set context to "SOURCE_ONLY" and include minimal fields
         print("OpenAI error:", ex)
         return None
 
-# ---------------- Offline fallback ----------------
 def offline_summary_fallback(title, text, url):
     sents = [s.strip() for s in re.split(r'\.|\n', text) if len(s.strip()) > 40]
     context = sents[0] if sents else title
@@ -402,52 +351,38 @@ def offline_summary_fallback(title, text, url):
         "image_bytes": None,
     }
 
-# ---------------- Post-parse validation ----------------
+# ---------------- Validation ----------------
 def looks_truncated(text):
-    """Return True if text appears truncated: ends with hyphen or last token is partial/digit or ends mid-word."""
     if not text:
         return False
     t = text.strip()
-    # ends with a hyphen meaning likely cut
     if t.endswith('-') or t.endswith('—'):
         return True
-    # ends with a word fragment (last char is alphanumeric but previous char is not space) - crude
-    if re.search(r'\w{0,3}$', t) and (len(t) > 0 and t[-1].isalnum() and not t.endswith('.')):
-        # check if ends with a number likely truncated e.g. "6"
-        if re.search(r'\d+$', t):
-            return True
-    # ends with incomplete clause (no terminal punctuation and length is long)
+    if re.search(r'\d+$', t):
+        return True
     if len(t) > 120 and not re.search(r'[\.!?]$', t):
         return True
     return False
 
 def validate_parsed(parsed):
-    """
-    Ensure parsed JSON has full sentences in critical fields.
-    If any core field looks truncated, return False.
-    """
     if not parsed:
         return False
-    # context and background and key_points should be present if include=yes
     include = str(parsed.get("include", "yes")).lower()
     if include != "yes":
-        return True  # it's intentionally excluded
-    # if context is SOURCE_ONLY, allow but mark as valid (we'll handle specially)
-    context = parsed.get("context", "") or ""
-    if context.strip().upper() == "SOURCE_ONLY":
         return True
-    background = parsed.get("background", "") or ""
-    # check for truncation
+    context = (parsed.get("context") or "").strip()
+    if context.upper() == "SOURCE_ONLY":
+        return True
+    background = (parsed.get("background") or "").strip()
     if looks_truncated(context) or looks_truncated(background):
         return False
-    # key_points: ensure each bullet not truncated
     kps = parsed.get("key_points", []) or []
     for kp in kps:
         if looks_truncated(kp):
             return False
     return True
 
-# ---------------- Logo generator & PDF builder & email (as before, robust) ----------------
+# ---------------- Logo generator & PDF builder & email ----------------
 def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78, 121), fg=(255, 255, 255)):
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -486,125 +421,112 @@ def build_pdf(structured_items, pdf_path):
     from PIL import Image as PILImage
     import io, datetime
 
-    doc = SimpleDocTemplate(
-        pdf_path,
-        pagesize=A4,
-        rightMargin=18 * mm,
-        leftMargin=18 * mm,
-        topMargin=18 * mm,
-        bottomMargin=18 * mm,
-    )
+    doc = SimpleDocTemplate(pdf_path, pagesize=A4,
+                            rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="TitleLarge", fontSize=16, alignment=1, textColor=colors.HexColor("#1f4e79")))
-    styles.add(ParagraphStyle(name="Section", fontSize=12, leading=14, spaceAfter=4, spaceBefore=8, textColor=colors.HexColor("#1f4e79")))
-    styles.add(ParagraphStyle(name="Body", fontSize=10, leading=13))
-    styles.add(ParagraphStyle(name="Meta", fontSize=8, leading=10, textColor=colors.grey))
+    styles.add(ParagraphStyle(name='TitleLarge', fontSize=16, alignment=1, textColor=colors.HexColor("#1f4e79")))
+    styles.add(ParagraphStyle(name='Section', fontSize=12, leading=14, spaceAfter=6, spaceBefore=10, textColor=colors.HexColor("#1f4e79")))
+    styles.add(ParagraphStyle(name='Body', fontSize=10, leading=13))
+    styles.add(ParagraphStyle(name='Meta', fontSize=8, leading=10, textColor=colors.grey))
 
     content = []
     today_str = datetime.datetime.now().strftime("%d %B %Y")
 
+    # header with logo
     logo_bytes = generate_logo_bytes()
-    left_elem = None
-    if logo_bytes:
-        try:
-            left_elem = RLImage(io.BytesIO(logo_bytes), width=110, height=28)
-        except Exception:
-            left_elem = Paragraph("DailyCAThroughAI", styles["Body"])
-    else:
-        left_elem = Paragraph("DailyCAThroughAI", styles["Body"])
-    right = Paragraph(f"<b>UPSC CURRENT AFFAIRS</b><br/>{today_str}", styles["TitleLarge"])
-    header_table = Table([[left_elem, right]], colWidths=[120, doc.width - 120])
-    header_table.setStyle(
-        TableStyle(
-            [
-                ("VALIGN", (0, 0), (1, 0), "MIDDLE"),
-                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f4f8fb")),
-                ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ]
-        )
-    )
+    left = RLImage(io.BytesIO(logo_bytes), width=110, height=28) if logo_bytes else Paragraph("DailyCAThroughAI", styles['Body'])
+    right = Paragraph(f"<b>UPSC CURRENT AFFAIRS</b><br/>{today_str}", styles['TitleLarge'])
+    header_table = Table([[left, right]], colWidths=[120, doc.width-120])
+    header_table.setStyle(TableStyle([
+        ('VALIGN',(0,0),(1,0),'MIDDLE'),
+        ('BACKGROUND',(0,0),(-1,-1), colors.HexColor("#f4f8fb")),
+        ('LEFTPADDING',(0,0),(-1,-1),8),
+        ('RIGHTPADDING',(0,0),(-1,-1),8),
+        ('BOTTOMPADDING',(0,0),(-1,-1),8),
+    ]))
     content.append(header_table)
-    content.append(Spacer(1, 8))
+    content.append(Spacer(1,8))
 
-    order = ["GS2", "GS3", "GS1", "GS4", "CME", "FFP", "Mapping", "Misc"]
-    for cat in order:
-        items = [it for it in structured_items if it.get("category") == cat]
+    # group items by category
+    categories_order = ["GS1","GS2","GS3","GS4","CME","FFP","Mapping","Misc"]
+    grouped = {c: [it for it in structured_items if it.get('category')==c] for c in categories_order}
+
+    for cat in categories_order:
+        items = grouped.get(cat, [])
         if not items:
             continue
-        content.append(Paragraph(cat, styles["Section"]))
-        for it in items:
-            paras = []
-            paras.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles["Body"]))
-            if it.get("context"):
-                paras.append(Paragraph(f"<i>Context:</i> {it.get('context')}", styles["Body"]))
-            if it.get("background"):
-                paras.append(Paragraph(f"<b>Background:</b> {it.get('background')}", styles["Body"]))
-            for kp in it.get("key_points", []):
-                paras.append(Paragraph(f"• {kp}", styles["Body"]))
-            if it.get("impact"):
-                paras.append(Paragraph(f"<b>Impact/Significance:</b> {it.get('impact')}", styles["Body"]))
-            upsc_rel = it.get("upsc_relevance", "")
-            if upsc_rel:
-                paras.append(Paragraph(f"<b>UPSC Relevance:</b> {upsc_rel}", styles["Body"]))
-            if it.get("source"):
-                paras.append(Paragraph(f"Source: {it.get('source')}", styles["Meta"]))
+        # section header with relevance label
+        label = infer_upsc_relevance_label_for_category(cat)
+        content.append(Paragraph(label, styles['Section']))
 
+        for it in items:
+            # build text only (no per-card relevance, no source)
+            paras = []
+            paras.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles['Body']))
+            if it.get('context'):
+                if (it.get('context') or "").strip().upper() == "SOURCE_ONLY":
+                    paras.append(Paragraph(f"<i>Context:</i> See source (SOURCE_ONLY)", styles['Body']))
+                else:
+                    paras.append(Paragraph(f"<i>Context:</i> {it.get('context')}", styles['Body']))
+            if it.get('background'):
+                paras.append(Paragraph(f"<b>Background:</b> {it.get('background')}", styles['Body']))
+            for kp in it.get('key_points', []):
+                paras.append(Paragraph(f"• {kp}", styles['Body']))
+            if it.get('impact'):
+                paras.append(Paragraph(f"<b>Impact/Significance:</b> {it.get('impact')}", styles['Body']))
+            # NOTE: per-card UPSC relevance and source intentionally omitted as per request
+
+            # chunk paragraphs
             chunk_size = 6
             chunks = [paras[i:i + chunk_size] for i in range(0, len(paras), chunk_size)]
 
-            imgb = it.get("image_bytes")
+            # prepare image for first chunk (if present)
+            imgb = it.get('image_bytes')
             right_col_first = None
             if imgb:
                 try:
                     img = PILImage.open(io.BytesIO(imgb))
                     img.load()
-                    w, h = img.size
-                    if w <= 0 or h <= 0 or w > 20000 or h > 20000:
+                    w,h = img.size
+                    if w<=0 or h<=0 or w>20000 or h>20000:
                         raise ValueError("image dimensions suspicious")
                     max_w, max_h = 180, 120
-                    if w > max_w or h > max_h:
+                    if w>max_w or h>max_h:
                         img.thumbnail((max_w, max_h))
                     aspect = (img.height / img.width) if img.width else 1
-                    if aspect > 6 or aspect < 0.05:
+                    if aspect>6 or aspect<0.05:
                         raise ValueError("unusual aspect ratio")
                     bb = io.BytesIO()
-                    img.save(bb, format="PNG")
+                    img.save(bb, format='PNG')
                     bb.seek(0)
                     img_w, img_h = img.size
-                    right_col_first = RLImage(bb, width=min(img_w, 150), height=min(img_h, 100))
+                    right_col_first = RLImage(bb, width=min(img_w,150), height=min(img_h,100))
                 except Exception as e:
                     print("⚠️ image skipped for article:", e)
                     right_col_first = None
 
             for idx, chunk in enumerate(chunks):
                 try:
-                    if idx == 0 and right_col_first:
-                        tbl = Table([[chunk, right_col_first]], colWidths=[doc.width * 0.66, doc.width * 0.34])
+                    if idx==0 and right_col_first:
+                        tbl = Table([[chunk, right_col_first]], colWidths=[doc.width*0.66, doc.width*0.34])
                     else:
                         tbl = Table([[chunk]], colWidths=[doc.width])
-                    tbl.setStyle(
-                        TableStyle(
-                            [
-                                ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cfdff0")),
-                                ("LEFTPADDING", (0, 0), (-1, -1), 8),
-                                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-                                ("TOPPADDING", (0, 0), (-1, -1), 6),
-                                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                            ]
-                        )
-                    )
+                    tbl.setStyle(TableStyle([
+                        ('BOX', (0,0), (-1,-1), 0.5, colors.HexColor("#cfdff0")),
+                        ('LEFTPADDING',(0,0),(-1,-1),8),
+                        ('RIGHTPADDING',(0,0),(-1,-1),8),
+                        ('TOPPADDING',(0,0),(-1,-1),6),
+                        ('BOTTOMPADDING',(0,0),(-1,-1),6),
+                    ]))
                     content.append(tbl)
-                    content.append(Spacer(1, 8))
+                    content.append(Spacer(1,8))
                 except Exception as e:
                     print("⚠️ table layout error for chunk, falling back to paragraphs:", e)
                     for p in chunk:
                         content.append(p)
-                    content.append(Spacer(1, 8))
+                    content.append(Spacer(1,8))
 
-    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original sources (PIB/The Hindu).", styles["Meta"]))
-
+    content.append(Paragraph("Note: Summaries auto-generated. Verify facts from original sources if needed.", styles['Meta']))
     try:
         doc.build(content)
     except Exception as e:
@@ -622,7 +544,6 @@ def build_pdf(structured_items, pdf_path):
         except Exception as e2:
             print("Failed to create minimal PDF fallback:", e2)
 
-# ---------------- EMAIL ----------------
 def email_pdf(pdf_path):
     SMTP_USER = os.environ.get("SMTP_USER")
     SMTP_PASS = os.environ.get("SMTP_PASSWORD")
@@ -678,14 +599,14 @@ def main():
     for e in candidates:
         if included >= MAX_INCLUSIONS:
             break
-        title = e.get("title", "")
-        link = e.get("link", "")
+        title = e.get("title","")
+        link = e.get("link","")
         print("Processing:", title)
 
-        # quick UPSC keyword filter (lightweight quick-check)
+        # quick UPSC keyword filter
         text_preview = ""
         try:
-            r = requests.get(link, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(link, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
             if r.status_code == 200:
                 text_preview = re.sub(r'<[^>]+>', ' ', r.text)[:3000].lower()
         except Exception:
@@ -700,46 +621,38 @@ def main():
             print(" -> no extractable text, skipping")
             continue
 
-        # 1) Try Groq
         parsed = groq_summarize(title, text, link)
-        # 2) OpenAI fallback
         if parsed is None and OPENAI_API_KEY:
             print("Groq failed; trying OpenAI fallback.")
             parsed = openai_summarize(OPENAI_API_KEY, title, text, link)
-        # 3) offline fallback
         if parsed is None:
             print("Both Groq/OpenAI failed; using offline fallback.")
             parsed = offline_summary_fallback(title, text, link)
-
         if not parsed:
             print(" -> no parsed JSON; skipping")
             continue
 
-        # ensure include decision
         include_flag = str(parsed.get("include", "yes")).lower()
         if include_flag != "yes":
             print(" -> model marked not relevant; skipping.")
             continue
 
-        # if parsed indicates SOURCE_ONLY in context, we keep but mark
         ctx_val = (parsed.get("context") or "").strip()
         if ctx_val.upper() == "SOURCE_ONLY":
-            # attach source prominently and proceed (this indicates text was incomplete)
-            parsed["context"] = "SOURCE_ONLY (see source link)"
+            parsed["context"] = "SOURCE_ONLY (see source)"
             parsed["key_points"] = parsed.get("key_points", []) or []
-            parsed["background"] = parsed.get("background", "") or ""
-            parsed["impact"] = parsed.get("impact", "") or ""
-            parsed["upsc_relevance"] = infer_upsc_relevance(parsed, title, text)
+            parsed["background"] = parsed.get("background","") or ""
+            parsed["impact"] = parsed.get("impact","") or ""
+            parsed["upsc_relevance"] = parsed.get("upsc_relevance","")
             parsed["category"] = normalize_model_category(parsed.get("category","")) or score_category_by_keywords(title, text)[0]
         else:
-            # validate parsed; if looks truncated, fallback to offline summary or mark SOURCE_ONLY
             is_valid = validate_parsed(parsed)
             if not is_valid:
                 print(" -> parsed JSON looks truncated; using offline fallback for safety")
                 parsed = offline_summary_fallback(title, text, link)
 
-        # determine category: prefer normalized model category if mappable, else score
-        model_cat_norm = normalize_model_category(parsed.get("category", "") or "")
+        # choose category
+        model_cat_norm = normalize_model_category(parsed.get("category","") or "")
         if model_cat_norm:
             category = model_cat_norm
             reason = "model_category"
@@ -748,14 +661,14 @@ def main():
             reason = f"scored (scores={scores})"
         parsed["category"] = category
 
-        # final upsc relevance inference
-        parsed["upsc_relevance"] = infer_upsc_relevance(parsed, title, text)
+        # set upsc_relevance (we will show label at section header)
+        parsed["upsc_relevance"] = parsed.get("upsc_relevance","") or infer_upsc_relevance_label_for_category(category)
 
-        # attach image and normalize fields
+        # attach image and normalize fields; remove source in displayed output (keep in data only)
         parsed["image_bytes"] = img_bytes
         parsed.setdefault("key_points", [])
-        parsed.setdefault("background", "")
-        parsed.setdefault("impact", "")
+        parsed.setdefault("background","")
+        parsed.setdefault("impact","")
         parsed.setdefault("source", link)
         kp = parsed.get("key_points", [])
         if isinstance(kp, str):
@@ -764,21 +677,21 @@ def main():
 
         structured.append(parsed)
         included += 1
-        print(f" -> included; category={category} (via {reason}); relevance={parsed.get('upsc_relevance')}")
+        print(f" -> included; category={category} (via {reason}); context_flag={'SOURCE_ONLY' if ctx_val.upper()=='SOURCE_ONLY' else 'OK'}")
         time.sleep(1.0)
 
     if not structured:
         print("No UPSC-relevant items found; building minimal fallback PDF.")
         for c in candidates[:3]:
             structured.append({
-                "category": "Misc",
-                "section_heading": c.get("title", ""),
+                "category":"Misc",
+                "section_heading": c.get("title",""),
                 "context": "Auto-added headline — no AI summary available today.",
-                "background": "",
-                "key_points": [c.get("title", "")],
-                "impact": "",
-                "upsc_relevance": "",
-                "source": c.get("link", ""),
+                "background":"",
+                "key_points":[c.get("title","")],
+                "impact":"",
+                "upsc_relevance":"",
+                "source": c.get("link",""),
                 "image_bytes": None
             })
 
