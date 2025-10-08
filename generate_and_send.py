@@ -2,17 +2,14 @@
 """
 generate_and_send.py
 
-Final UPSC Daily Brief generator with:
-- Groq primary summarization, OpenAI optional fallback, offline fallback
-- UPSC-focused feed filtering, UPSC keyword filter
-- Improved categorization (Step 4): maps topics to GS papers / categories
-- Safe image handling, programmatic logo, boxed card PDF layout with chunking
-- Ensures a PDF is always produced and emailed
+UPSC Daily Brief generator — safe_trim + post-parse validation + improved classification.
 
-Requirements (GitHub Actions):
-- Secrets: GROQ_API_KEY, SMTP_USER, SMTP_PASSWORD, EMAIL_TO
-- Optional: OPENAI_API_KEY
-- Dependencies: feedparser, newspaper3k, reportlab, requests, pillow, readability-lxml, openai (if used)
+Features:
+- Groq primary summarization, OpenAI fallback, offline fallback
+- safe_trim to avoid truncating sentences mid-word
+- scoring-based classifier + extended keyword lists (better GS1/GS3 detection)
+- post-parse validation (detect truncated outputs and fallback)
+- robust PDF layout, logo, safe image handling, chunking, email
 """
 
 import os
@@ -33,7 +30,6 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "mixtral-8x7b")
 
-# Curated UPSC-centric feeds (prioritise UPSC-focused sources)
 RSS_FEEDS = [
     "https://www.drishtiias.com/feed",
     "https://www.insightsonindia.com/feed",
@@ -46,27 +42,45 @@ RSS_FEEDS = [
 MAX_CANDIDATES = 30
 MAX_INCLUSIONS = 12
 
-# Keywords to quickly filter out non-UPSC items
 UPSC_KEYWORDS = [
     "upsc", "governance", "policy", "environment", "economy",
     "ethics", "international", "constitution", "biodiversity",
     "reform", "initiative", "scheme", "pib", "report", "summit",
-    "nobel", "isro", "climate", "vaccine", "trade", "rbi", "supreme court"
+    "nobel", "isro", "climate", "vaccine", "trade", "rbi", "supreme court",
+    "study", "research", "index", "survey", "mapping", "geography", "map"
 ]
 
-# Mapping keywords → category label (Step 4 improved categorization)
+# Category keywords for scoring classifier (expanded to detect geography/science)
 CATEGORY_KEYWORDS = {
-    "GS1": ["tribal", "caste", "society", "population", "culture", "heritage", "migration", "demography", "education", "health"],
-    "GS2": ["constitution", "cabinet", "parliament", "legislation", "judgment", "supreme court", "high court", "governance", "police", "bureaucracy", "policy", "dpr", "pib"],
-    "GS3": ["economy", "gdp", "inflation", "rbi", "bank", "finance", "industry", "agriculture", "infrastructure", "climate", "environment", "isro", "science", "technology", "nobel", "biodiversity", "ecosystem"],
-    "GS4": ["ethics", "integrity", "corruption", "values", "moral", "public service", "code of conduct"],
-    "CME": ["study", "index", "report", "research", "survey", "analysis"],
-    "Mapping": ["map", "location", "geography", "boundary", "river", "plateau"],
-    "FFP": ["finance", "fiscal", "budget", "public finance"],
+    "GS1": ["tribal", "caste", "society", "population", "culture", "heritage",
+            "migration", "demography", "education", "health", "poverty", "geography", "river", "plateau"],
+    "GS2": ["constitution", "cabinet", "parliament", "legislation", "judgment",
+            "supreme court", "high court", "governance", "police", "bureaucracy",
+            "policy", "pib", "court", "minister", "administration"],
+    "GS3": ["economy", "gdp", "inflation", "rbi", "bank", "finance", "industry",
+            "agriculture", "infrastructure", "climate", "environment", "isro",
+            "science", "technology", "nobel", "biodiversity", "ecosystem", "research",
+            "energy", "trade", "tectonic", "rift", "sediment", "paleo", "palaeo"],
+    "GS4": ["ethics", "integrity", "corruption", "values", "moral",
+            "public service", "code of conduct", "ethical"],
+    "CME": ["study", "index", "report", "research", "survey", "analysis", "paper", "finding"],
+    "Mapping": ["map", "location", "geography", "boundary", "river", "plateau", "island"],
+    "FFP": ["finance", "fiscal", "budget", "public finance", "tax", "expenditure"],
     "Misc": []
 }
 
-# ---------------- UTILITIES ----------------
+RELEVANCE_KEYWORDS = {
+    "environment": ("GS3 — Environment", ["environment", "climate", "biodiversity", "forest", "species", "pollution", "ecosystem", "western ghats", "ghg"]),
+    "economy": ("GS3 — Economy", ["rbi", "inflation", "gdp", "fiscal", "budget", "economy", "exports", "imports", "trade", "tax", "finance"]),
+    "polity": ("GS2 — Polity & Governance", ["cabinet", "supreme court", "high court", "constitution", "bill", "act", "parliament", "legislation", "govt", "minister"]),
+    "international": ("GS2 — International Relations", ["summit", "g20", "un", "treaty", "agreement", "china", "india", "foreign", "diplomacy"]),
+    "science": ("GS3 — Science & Tech", ["nobel", "vaccine", "space", "isro", "research", "scientists", "technology", "study", "tectonic", "rift"]),
+    "defence": ("GS3 — Security", ["defence", "army", "navy", "air force", "border", "terror", "military"]),
+    "social": ("GS1 — Society", ["tribal", "tribe", "caste", "poverty", "education", "health", "disease", "women", "child"]),
+    "ethics": ("GS4 — Ethics", ["ethics", "corruption", "integrity", "ethical", "code of conduct"]),
+}
+
+# ---------------- Utilities ----------------
 def clean_extracted_text(raw_text):
     if not raw_text:
         return ""
@@ -82,9 +96,32 @@ def clean_extracted_text(raw_text):
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
+def safe_trim(text, max_chars=3500):
+    """
+    Trim to max_chars but avoid cutting mid-sentence.
+    Return up to the last period within the window (if reasonably far in),
+    else return the window itself.
+    """
+    if not text or len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    # find last sentence end
+    last_period = max(window.rfind('.'), window.rfind('!'), window.rfind('?'))
+    if last_period and last_period > int(max_chars * 0.6):
+        return window[:last_period+1]
+    # fallback: try to break at last newline
+    last_nl = window.rfind('\n')
+    if last_nl and last_nl > int(max_chars * 0.5):
+        return window[:last_nl].rstrip()
+    # final fallback: return window but strip trailing partial word
+    if window and window[-1].isalnum():
+        # drop trailing partial token
+        return re.sub(r'\s+\S*?$', '', window)
+    return window
+
 def extract_article_text_and_image(url, timeout=12):
     headers = {"User-Agent": "Mozilla/5.0"}
-    # newspaper3k attempt
+    # newspaper3k
     try:
         from newspaper import Article
         art = Article(url)
@@ -127,7 +164,7 @@ def extract_article_text_and_image(url, timeout=12):
     except Exception:
         pass
 
-    # basic fallback — strip tags
+    # basic fallback
     try:
         r = requests.get(url, timeout=timeout, headers=headers)
         html = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', ' ', r.text)
@@ -169,54 +206,106 @@ def extract_json_substring(s):
                     return None
     return None
 
-# ---------------- Categorization (Step 4) ----------------
-def classify_category(title, text):
-    """Return a category string (GS1, GS2, GS3, GS4, CME, Mapping, FFP, Misc)."""
+# ---------------- Classification & relevance ----------------
+def normalize_model_category(cat_str):
+    if not cat_str:
+        return ""
+    s = cat_str.strip().lower()
+    m = re.search(r'gs\s*([1-4])', s)
+    if m:
+        return f"GS{m.group(1)}"
+    if any(w in s for w in ["polity", "governance", "constitution", "parliament", "judgment"]):
+        return "GS2"
+    if any(w in s for w in ["economy", "finance", "gdp", "rbi", "trade", "industry"]):
+        return "GS3"
+    if any(w in s for w in ["environment", "climate", "biodiversity", "tectonic", "paleo", "nobel", "isro"]):
+        return "GS3"
+    if any(w in s for w in ["ethic", "ethics", "integrity", "corruption"]):
+        return "GS4"
+    if any(w in s for w in ["society", "social", "tribal", "caste", "education", "health"]):
+        return "GS1"
+    if any(w in s for w in ["cme", "study", "report", "index", "research"]):
+        return "CME"
+    if any(w in s for w in ["map", "mapping", "geography", "location"]):
+        return "Mapping"
+    if any(w in s for w in ["ffp", "finance", "fiscal", "budget"]):
+        return "FFP"
+    return ""
+
+def score_category_by_keywords(title, text):
     combined = (title + " " + text).lower()
+    scores = {cat: 0.0 for cat in CATEGORY_KEYWORDS.keys()}
     for cat, kws in CATEGORY_KEYWORDS.items():
         for kw in kws:
-            if kw in combined:
-                return cat
-    # heuristics for single-word signals
-    if "nobel" in combined or "research" in combined:
-        return "GS3"
-    if "ethic" in combined or "corruption" in combined:
-        return "GS4"
-    if "map" in combined or "geograph" in combined:
-        return "Mapping"
-    return "Misc"
-
-# ---------------- UPSC relevance inference ----------------
-RELEVANCE_KEYWORDS = {
-    "environment": ("GS3 — Environment", ["environment", "climate", "biodiversity", "forest", "species", "pollution", "ghg", "ecosystem", "western ghats"]),
-    "economy": ("GS3 — Economy", ["rbi", "inflation", "gdp", "fiscal", "budget", "economy", "exports", "imports", "trade"]),
-    "polity": ("GS2 — Polity & Governance", ["cabinet", "supreme court", "high court", "constitution", "bill", "act", "parliament", "legislation", "govt"]),
-    "international": ("GS2 — International Relations", ["summit", "g20", "un", "treaty", "agreement", "china", "india", "foreign"]),
-    "science": ("GS3 — Science & Tech", ["nobel", "vaccine", "space", "isro", "research", "scientists", "technology"]),
-    "defence": ("GS3 — Security", ["defence", "army", "navy", "air force", "border", "terror", "military"]),
-    "social": ("GS1 — Society", ["tribal", "tribe", "caste", "poverty", "education", "health", "disease", "nutrition"]),
-    "ethics": ("GS4 — Ethics", ["ethics", "corruption", "integrity", "ethical", "code of conduct"]),
-}
+            # simple occurrence count with small weight for longer keywords
+            cnt = combined.count(kw)
+            if cnt:
+                scores[cat] += cnt * (1.0 + min(len(kw) / 12.0, 1.5))
+    sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_cat, best_score = sorted_scores[0]
+    if best_score <= 0:
+        return "Misc", scores
+    # check closeness to second best
+    second_score = sorted_scores[1][1] if len(sorted_scores) > 1 else 0
+    if second_score >= 0.7 * best_score:
+        priority = ["GS2", "GS3", "GS1", "GS4", "CME", "FFP", "Mapping", "Misc"]
+        for p in priority:
+            if abs(scores.get(p, 0) - best_score) < 1e-6 or scores.get(p, 0) == best_score:
+                return p, scores
+        return best_cat, scores
+    return best_cat, scores
 
 def infer_upsc_relevance(parsed, title, text):
     upsc_rel = (parsed.get("upsc_relevance") or "").strip()
-    if upsc_rel and upsc_rel.lower() not in ["general current affairs", "general", "n/a", ""]:
+    if upsc_rel and len(upsc_rel) > 6 and upsc_rel.lower() not in ["general current affairs", "general", "n/a", ""]:
         return upsc_rel
+    model_cat_norm = normalize_model_category(parsed.get("category", "") or "")
+    if model_cat_norm:
+        if model_cat_norm == "GS1":
+            return "GS1 — Society/Geography"
+        if model_cat_norm == "GS2":
+            return "GS2 — Polity & Governance"
+        if model_cat_norm == "GS3":
+            return "GS3 — Economy/Science/Environment"
+        if model_cat_norm == "GS4":
+            return "GS4 — Ethics"
+        if model_cat_norm == "CME":
+            return "CME — Studies & Reports"
+        if model_cat_norm == "Mapping":
+            return "Mapping — Geography/Location"
+        if model_cat_norm == "FFP":
+            return "FFP — Public Finance"
     combined = (title + " " + text).lower()
     for key, (label, kws) in RELEVANCE_KEYWORDS.items():
         for kw in kws:
             if kw in combined:
                 return label
-    return "GS2/GS3 — Current Affairs"
+    cat, scores = score_category_by_keywords(title, text)
+    if cat == "GS1":
+        return "GS1 — Society/Geography"
+    if cat == "GS2":
+        return "GS2 — Polity & Governance"
+    if cat == "GS3":
+        return "GS3 — Economy/Science/Environment"
+    if cat == "GS4":
+        return "GS4 — Ethics"
+    if cat == "CME":
+        return "CME — Studies & Reports"
+    if cat == "Mapping":
+        return "Mapping — Geography/Location"
+    if cat == "FFP":
+        return "FFP — Public Finance"
+    return "General Current Affairs"
 
-# ---------------- GROQ summarization (primary) ----------------
+# ---------------- GROQ summarization ----------------
 def call_groq_with_retries(url, headers, payload, attempts=3, backoff=3, timeout=90):
     for i in range(attempts):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             print(f"[groq] attempt {i+1} status {r.status_code}")
-            body_snippet = r.text[:800].replace("\n", " ")
-            print("[groq] body_snippet:", body_snippet)
+            body_snippet = r.text[:1000].replace("\n", " ")
+            if len(body_snippet) > 0:
+                print("[groq] body_snippet:", body_snippet[:800])
             return r
         except Exception as ex:
             print(f"[groq] exception attempt {i+1}:", ex)
@@ -227,6 +316,8 @@ def groq_summarize(title, text, url, timeout=90):
     if not GROQ_API_KEY:
         print("No GROQ_API_KEY found.")
         return None
+    # use safe_trim to avoid sending mid-sentence text to the model
+    trimmed = safe_trim(text, max_chars=3500)
     prompt = f"""
 You are a UPSC current-affairs analyst producing InsightsIAS-style notes.
 Respond STRICTLY with valid JSON only and nothing else. Keys required:
@@ -234,9 +325,10 @@ include, category, section_heading, context, background, key_points (list), impa
 
 Article title: {title}
 Article URL: {url}
-Article text (trimmed): {text[:3500]}
+Article text (trimmed, keep sentences intact): {trimmed}
 
 Decide include: "yes" if relevant for UPSC (GS papers or FFP/CME/Mapping), otherwise "no".
+Important: do not invent facts. If the article text is incomplete/truncated, state "SOURCE_ONLY" in 'context' and keep other fields empty or minimal, and set include to "yes" if source itself is relevant.
 """
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0, "max_tokens": 900}
@@ -245,7 +337,7 @@ Decide include: "yes" if relevant for UPSC (GS papers or FFP/CME/Mapping), other
         print("Groq: no response after retries.")
         return None
     if r.status_code != 200:
-        print("Groq returned non-200:", r.status_code)
+        print("Groq returned non-200:", r.status_code, getattr(r, "text", "")[:1000])
         return None
     try:
         data = r.json()
@@ -253,10 +345,10 @@ Decide include: "yes" if relevant for UPSC (GS papers or FFP/CME/Mapping), other
         parsed = extract_json_substring(content)
         return parsed
     except Exception as ex:
-        print("Groq parse error:", ex)
+        print("Groq parse error:", ex, getattr(r, "text", "")[:800])
         return None
 
-# ---------------- OpenAI fallback (optional) ----------------
+# ---------------- OpenAI fallback ----------------
 def openai_summarize(openai_key, title, text, url):
     if not openai_key:
         return None
@@ -266,13 +358,16 @@ def openai_summarize(openai_key, title, text, url):
         print("OpenAI import failed:", e)
         return None
     client = OpenAI(api_key=openai_key)
+    trimmed = safe_trim(text, max_chars=3500)
     prompt = f"""
 You are a UPSC editor. Return strict JSON only with:
 include, category, section_heading, context, background, key_points, impact, upsc_relevance, source
 
 Title: {title}
 URL: {url}
-Text (trimmed): {text[:3500]}
+Text (trimmed): {trimmed}
+
+If text seems truncated, set context to "SOURCE_ONLY" and include minimal fields.
 """
     try:
         resp = client.chat.completions.create(
@@ -307,7 +402,52 @@ def offline_summary_fallback(title, text, url):
         "image_bytes": None,
     }
 
-# ---------------- Logo generator (Pillow >=10 safe) ----------------
+# ---------------- Post-parse validation ----------------
+def looks_truncated(text):
+    """Return True if text appears truncated: ends with hyphen or last token is partial/digit or ends mid-word."""
+    if not text:
+        return False
+    t = text.strip()
+    # ends with a hyphen meaning likely cut
+    if t.endswith('-') or t.endswith('—'):
+        return True
+    # ends with a word fragment (last char is alphanumeric but previous char is not space) - crude
+    if re.search(r'\w{0,3}$', t) and (len(t) > 0 and t[-1].isalnum() and not t.endswith('.')):
+        # check if ends with a number likely truncated e.g. "6"
+        if re.search(r'\d+$', t):
+            return True
+    # ends with incomplete clause (no terminal punctuation and length is long)
+    if len(t) > 120 and not re.search(r'[\.!?]$', t):
+        return True
+    return False
+
+def validate_parsed(parsed):
+    """
+    Ensure parsed JSON has full sentences in critical fields.
+    If any core field looks truncated, return False.
+    """
+    if not parsed:
+        return False
+    # context and background and key_points should be present if include=yes
+    include = str(parsed.get("include", "yes")).lower()
+    if include != "yes":
+        return True  # it's intentionally excluded
+    # if context is SOURCE_ONLY, allow but mark as valid (we'll handle specially)
+    context = parsed.get("context", "") or ""
+    if context.strip().upper() == "SOURCE_ONLY":
+        return True
+    background = parsed.get("background", "") or ""
+    # check for truncation
+    if looks_truncated(context) or looks_truncated(background):
+        return False
+    # key_points: ensure each bullet not truncated
+    kps = parsed.get("key_points", []) or []
+    for kp in kps:
+        if looks_truncated(kp):
+            return False
+    return True
+
+# ---------------- Logo generator & PDF builder & email (as before, robust) ----------------
 def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78, 121), fg=(255, 255, 255)):
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -337,7 +477,6 @@ def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78
     bio.seek(0)
     return bio.read()
 
-# ---------------- PDF generation with safe images and chunking ----------------
 def build_pdf(structured_items, pdf_path):
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -364,7 +503,6 @@ def build_pdf(structured_items, pdf_path):
     content = []
     today_str = datetime.datetime.now().strftime("%d %B %Y")
 
-    # Header (logo left, title right)
     logo_bytes = generate_logo_bytes()
     left_elem = None
     if logo_bytes:
@@ -397,7 +535,6 @@ def build_pdf(structured_items, pdf_path):
             continue
         content.append(Paragraph(cat, styles["Section"]))
         for it in items:
-            # Build flowable paragraphs
             paras = []
             paras.append(Paragraph(f"<b>{it.get('section_heading','')}</b>", styles["Body"]))
             if it.get("context"):
@@ -414,11 +551,9 @@ def build_pdf(structured_items, pdf_path):
             if it.get("source"):
                 paras.append(Paragraph(f"Source: {it.get('source')}", styles["Meta"]))
 
-            # Split into chunks to avoid layout overflow
             chunk_size = 6
             chunks = [paras[i:i + chunk_size] for i in range(0, len(paras), chunk_size)]
 
-            # Prepare image for first chunk
             imgb = it.get("image_bytes")
             right_col_first = None
             if imgb:
@@ -527,7 +662,6 @@ def main():
         except Exception as ex:
             print("Feed parse error for", feed, ex)
 
-    # dedupe and limit
     seen = set()
     candidates = []
     for e in entries:
@@ -548,10 +682,9 @@ def main():
         link = e.get("link", "")
         print("Processing:", title)
 
-        # quick UPSC keyword filter — skip entirely if clearly unrelated
+        # quick UPSC keyword filter (lightweight quick-check)
         text_preview = ""
         try:
-            # lightweight fetch first 2000 chars for quick filter
             r = requests.get(link, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 text_preview = re.sub(r'<[^>]+>', ' ', r.text)[:3000].lower()
@@ -567,15 +700,13 @@ def main():
             print(" -> no extractable text, skipping")
             continue
 
-        parsed = None
         # 1) Try Groq
         parsed = groq_summarize(title, text, link)
-        # 2) OpenAI fallback (optional)
+        # 2) OpenAI fallback
         if parsed is None and OPENAI_API_KEY:
             print("Groq failed; trying OpenAI fallback.")
             parsed = openai_summarize(OPENAI_API_KEY, title, text, link)
-
-        # 3) Offline fallback
+        # 3) offline fallback
         if parsed is None:
             print("Both Groq/OpenAI failed; using offline fallback.")
             parsed = offline_summary_fallback(title, text, link)
@@ -584,22 +715,40 @@ def main():
             print(" -> no parsed JSON; skipping")
             continue
 
-        # include decision
+        # ensure include decision
         include_flag = str(parsed.get("include", "yes")).lower()
         if include_flag != "yes":
             print(" -> model marked not relevant; skipping.")
             continue
 
-        # assign category: prefer model output if sensible, else use classifier
-        model_cat = parsed.get("category", "") or ""
-        if model_cat and model_cat.strip():
-            category = model_cat
+        # if parsed indicates SOURCE_ONLY in context, we keep but mark
+        ctx_val = (parsed.get("context") or "").strip()
+        if ctx_val.upper() == "SOURCE_ONLY":
+            # attach source prominently and proceed (this indicates text was incomplete)
+            parsed["context"] = "SOURCE_ONLY (see source link)"
+            parsed["key_points"] = parsed.get("key_points", []) or []
+            parsed["background"] = parsed.get("background", "") or ""
+            parsed["impact"] = parsed.get("impact", "") or ""
+            parsed["upsc_relevance"] = infer_upsc_relevance(parsed, title, text)
+            parsed["category"] = normalize_model_category(parsed.get("category","")) or score_category_by_keywords(title, text)[0]
         else:
-            category = classify_category(title, text)
+            # validate parsed; if looks truncated, fallback to offline summary or mark SOURCE_ONLY
+            is_valid = validate_parsed(parsed)
+            if not is_valid:
+                print(" -> parsed JSON looks truncated; using offline fallback for safety")
+                parsed = offline_summary_fallback(title, text, link)
+
+        # determine category: prefer normalized model category if mappable, else score
+        model_cat_norm = normalize_model_category(parsed.get("category", "") or "")
+        if model_cat_norm:
+            category = model_cat_norm
+            reason = "model_category"
+        else:
+            category, scores = score_category_by_keywords(title, text)
+            reason = f"scored (scores={scores})"
         parsed["category"] = category
 
-        # improve upsc_relevance if generic
-        parsed.setdefault("upsc_relevance", "")
+        # final upsc relevance inference
         parsed["upsc_relevance"] = infer_upsc_relevance(parsed, title, text)
 
         # attach image and normalize fields
@@ -615,11 +764,11 @@ def main():
 
         structured.append(parsed)
         included += 1
-        print(f" -> included (category: {parsed.get('category')}; relevance: {parsed.get('upsc_relevance')})")
+        print(f" -> included; category={category} (via {reason}); relevance={parsed.get('upsc_relevance')}")
         time.sleep(1.0)
 
     if not structured:
-        print("No UPSC-relevant items found; building minimal fallback PDF with top headlines.")
+        print("No UPSC-relevant items found; building minimal fallback PDF.")
         for c in candidates[:3]:
             structured.append({
                 "category": "Misc",
