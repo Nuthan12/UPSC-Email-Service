@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """
-generate_and_send.py — final complete script
+generate_and_send.py — final complete script (fixed: style name collisions)
 
-Features:
-- Fetch candidate articles from RSS feeds.
-- Try Groq -> OpenAI for structured JSON (if keys set).
-- Deterministic offline fallback to guarantee Context / About / Facts / Policy / Detailed Brief / Impact.
-- Optional web enrichment via SERPAPI_KEY or BING_API_KEY to fetch authoritative scheme/policy pages.
-- Robust PDF generation: simple boxed cards, right-aligned images (no fragile two-column tables).
-- Email the generated PDF via SMTP.
-- Test mode: --test-url creates TEST PDF and does not email.
+This is the same full script you had before, but it avoids adding duplicate
+ReportLab stylesheet names (KeyError). It creates styles only if missing.
 """
 
 import os
@@ -535,6 +529,18 @@ def process_article(title, url, text, img_bytes):
     return parsed, used_model
 
 # ---------------- PDF helpers & builder (simple, robust) ----------------
+def ensure_style(stylesheet, name, **kwargs):
+    """Add a ParagraphStyle to stylesheet if it does not already exist."""
+    if name in stylesheet.byName:
+        return stylesheet.byName[name]
+    ps = ParagraphStyle(name=name, **kwargs)
+    try:
+        stylesheet.add(ps)
+    except Exception:
+        # fallback: if add fails for any odd reason, overwrite byName directly
+        stylesheet.byName[name] = ps
+    return ps
+
 def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78, 121), fg=(255, 255, 255)):
     try:
         img = PILImage.new("RGB", size, bgcolor)
@@ -586,7 +592,6 @@ def split_into_paragraphs(text, chunk=800):
     while start < L:
         end = start + chunk
         if end < L:
-            # try to break at sentence end or space
             next_break = text.rfind('.', start, end)
             if next_break <= start:
                 next_break = text.rfind(' ', start, end)
@@ -600,10 +605,11 @@ def split_into_paragraphs(text, chunk=800):
 def build_pdf_simple(articles, out_path):
     doc = SimpleDocTemplate(out_path, pagesize=A4, rightMargin=18*mm, leftMargin=18*mm, topMargin=18*mm, bottomMargin=18*mm)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Title", fontSize=13, leading=15))
-    styles.add(ParagraphStyle(name="Body", fontSize=10, leading=13))
-    styles.add(ParagraphStyle(name="Section", fontSize=12, leading=14, textColor=colors.HexColor("#1f4e79")))
-    styles.add(ParagraphStyle(name="SmallGray", fontSize=8, leading=10, textColor=colors.grey))
+    # use ensure_style to avoid KeyError
+    ensure_style(styles, "UPSC_Title", fontSize=13, leading=15)
+    ensure_style(styles, "UPSC_Body", fontSize=10, leading=13)
+    ensure_style(styles, "UPSC_Section", fontSize=12, leading=14, textColor=colors.HexColor("#1f4e79"))
+    ensure_style(styles, "UPSC_SmallGray", fontSize=8, leading=10, textColor=colors.grey)
 
     story = []
     today = datetime.datetime.now().strftime("%d %B %Y")
@@ -612,7 +618,7 @@ def build_pdf_simple(articles, out_path):
         img = RLImage(io.BytesIO(logo), width=120, height=32)
         img.hAlign = 'LEFT'
         story.append(img)
-    story.append(Paragraph(f"<b>UPSC CURRENT AFFAIRS</b> — {today}", styles["Title"]))
+    story.append(Paragraph(f"<b>UPSC CURRENT AFFAIRS</b> — {today}", styles["UPSC_Title"]))
     story.append(Spacer(1, 8))
 
     order = ["GS1", "GS2", "GS3", "GS4", "CME", "FFP", "Mapping", "Misc"]
@@ -625,12 +631,12 @@ def build_pdf_simple(articles, out_path):
         items = grouped.get(cat, [])
         if not items:
             continue
-        story.append(Paragraph(CATEGORY_LABELS.get(cat, cat), styles["Section"]))
+        story.append(Paragraph(CATEGORY_LABELS.get(cat, cat), styles["UPSC_Section"]))
         story.append(Spacer(1, 6))
         for it in items:
-            story.append(Paragraph(f"<b>{it.get('section_heading','Untitled')}</b>", styles["Title"]))
+            story.append(Paragraph(f"<b>{it.get('section_heading','Untitled')}</b>", styles["UPSC_Title"]))
             meta = f"{it.get('upsc_relevance','')} • Source: {it.get('source','')}"
-            story.append(Paragraph(meta, styles["SmallGray"]))
+            story.append(Paragraph(meta, styles["UPSC_SmallGray"]))
             story.append(Spacer(1, 4))
 
             img_elem = None
@@ -642,35 +648,35 @@ def build_pdf_simple(articles, out_path):
 
             if it.get("context"):
                 for p in split_into_paragraphs(it.get("context", ""), chunk=800):
-                    story.append(Paragraph(f"<b>Context:</b> {p}", styles["Body"]))
+                    story.append(Paragraph(f"<b>Context:</b> {p}", styles["UPSC_Body"]))
             if it.get("about"):
                 for p in split_into_paragraphs(it.get("about", ""), chunk=800):
-                    story.append(Paragraph(f"<b>About:</b> {p}", styles["Body"]))
+                    story.append(Paragraph(f"<b>About:</b> {p}", styles["UPSC_Body"]))
 
             facts = it.get("facts_and_policies", []) or []
             if facts:
-                story.append(Paragraph("<b>Facts & Data:</b>", styles["Body"]))
-                bullets = [ListItem(Paragraph(f, styles["Body"])) for f in facts]
+                story.append(Paragraph("<b>Facts & Data:</b>", styles["UPSC_Body"]))
+                bullets = [ListItem(Paragraph(f, styles["UPSC_Body"])) for f in facts]
                 story.append(ListFlowable(bullets, bulletType='bullet', leftIndent=12))
 
             subs = it.get("sub_sections", []) or []
             for s in subs:
                 head = s.get("heading", ""); pts = s.get("points", []) or []
                 if head:
-                    story.append(Paragraph(f"<b>{head}:</b>", styles["Body"]))
+                    story.append(Paragraph(f"<b>{head}:</b>", styles["UPSC_Body"]))
                 if pts:
-                    bullets = [ListItem(Paragraph(p, styles["Body"])) for p in pts]
+                    bullets = [ListItem(Paragraph(p, styles["UPSC_Body"])) for p in pts]
                     story.append(ListFlowable(bullets, bulletType='bullet', leftIndent=12))
 
             if it.get("detailed_brief"):
-                story.append(Paragraph("<b>Detailed Brief:</b>", styles["Body"]))
+                story.append(Paragraph("<b>Detailed Brief:</b>", styles["UPSC_Body"]))
                 for p in split_into_paragraphs(it.get("detailed_brief", ""), chunk=800):
-                    story.append(Paragraph(p, styles["Body"]))
+                    story.append(Paragraph(p, styles["UPSC_Body"]))
 
             impact = it.get("impact_or_analysis", []) or []
             if impact:
-                story.append(Paragraph("<b>Impact / Analysis:</b>", styles["Body"]))
-                bullets = [ListItem(Paragraph(p, styles["Body"])) for p in impact]
+                story.append(Paragraph("<b>Impact / Analysis:</b>", styles["UPSC_Body"]))
+                bullets = [ListItem(Paragraph(p, styles["UPSC_Body"])) for p in impact]
                 story.append(ListFlowable(bullets, bulletType='bullet', leftIndent=12))
 
             story.append(Spacer(1, 8))
@@ -681,7 +687,7 @@ def build_pdf_simple(articles, out_path):
     story.append(Paragraph("Note: Auto-generated summaries; verify facts from original sources if needed.", ParagraphStyle(name="note", fontSize=8, textColor=colors.grey)))
     try:
         doc.build(story)
-        return out_path
+        return out_path if (out_path := out_path) else out_path
     except Exception as e:
         print("PDF build failed:", e)
         return None
