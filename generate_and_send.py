@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-generate_and_send.py — simplified, robust layout (no fragile tables)
+generate_and_send.py — final complete script
 
-Goals:
-- Prevent skipped items due to layout errors.
-- Produce boxed article cards consistently (title, small right-aligned image,
-  Context, About, Facts, PolicyPoints, Detailed Brief, Impact).
-- Keep paragraphs small so ReportLab can paginate them.
-- Use previous model/offline/web enrichment pipeline unchanged.
+Features:
+- Fetch candidate articles from RSS feeds.
+- Try Groq -> OpenAI for structured JSON (if keys set).
+- Deterministic offline fallback to guarantee Context / About / Facts / Policy / Detailed Brief / Impact.
+- Optional web enrichment via SERPAPI_KEY or BING_API_KEY to fetch authoritative scheme/policy pages.
+- Robust PDF generation: simple boxed cards, right-aligned images (no fragile two-column tables).
+- Email the generated PDF via SMTP.
+- Test mode: --test-url creates TEST PDF and does not email.
 """
 
-import os, re, io, sys, time, json, ssl, argparse, smtplib, datetime, requests, feedparser
+import os
+import re
+import io
+import sys
+import time
+import json
+import ssl
+import argparse
+import smtplib
+import datetime
+import requests
+import feedparser
 from email.message import EmailMessage
 from pprint import pprint
 
+# PDF and image libs
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
@@ -24,7 +38,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.enums import TA_LEFT
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
-# ---------------- Config (same as before) ----------------
+# ---------------- CONFIG ----------------
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "mixtral-8x7b")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -41,6 +55,7 @@ EMAIL_TO = os.environ.get("EMAIL_TO")
 
 PDF_FILENAME_TEMPLATE = "UPSC_AI_Brief_{date}.pdf"
 
+# Feeds chosen for UPSC-relevant content
 RSS_FEEDS = [
     "https://www.insightsonindia.com/feed",
     "https://www.drishtiias.com/feed",
@@ -63,114 +78,149 @@ CATEGORY_LABELS = {
     "Misc": "Miscellaneous Current Affairs"
 }
 
-# ---------------- Utilities (kept simple) ----------------
+# ---------------- Utilities ----------------
 def safe_trim(text, max_chars=3800):
-    if not text: return ""
-    if len(text) <= max_chars: return text
-    w = text[:max_chars]
-    last = max(w.rfind('.'), w.rfind('?'), w.rfind('!'))
-    if last > int(max_chars*0.6): return w[:last+1]
-    ln = w.rfind('\n'); 
-    if ln > int(max_chars*0.5): return w[:ln]
-    return re.sub(r'\s+\S*?$', '', w)
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars]
+    last_p = max(window.rfind('.'), window.rfind('?'), window.rfind('!'))
+    if last_p > int(max_chars * 0.6):
+        return window[:last_p+1]
+    last_n = window.rfind('\n')
+    if last_n > int(max_chars * 0.5):
+        return window[:last_n]
+    return re.sub(r'\s+\S*?$', '', window)
 
 def clean_text(raw):
-    if not raw: return ""
-    t = raw.replace("\r","\n")
+    if not raw:
+        return ""
+    t = raw.replace("\r", "\n")
     junk = [r"SEE ALL NEWSLETTERS", r"ADVERTISEMENT", r"Subscribe", r"Read more", r"Continue reading"]
-    for p in junk: t = re.sub(p, " ", t, flags=re.I)
-    lines = [ln.strip() for ln in t.splitlines() if len(ln.strip())>30 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())]
+    for p in junk:
+        t = re.sub(p, " ", t, flags=re.I)
+    lines = [ln.strip() for ln in t.splitlines() if len(ln.strip()) > 30 and not re.match(r'^[A-Z\s]{15,}$', ln.strip())]
     out = "\n\n".join(lines)
     out = re.sub(r'\n{3,}', '\n\n', out)
     return out.strip()
 
 def extract_json_substring(s):
-    if not s: return None
-    i = s.find('{'); 
-    if i==-1: return None
-    depth=0
-    for j in range(i,len(s)):
-        if s[j]=='{': depth+=1
-        elif s[j]=='}':
-            depth-=1
-            if depth==0:
+    if not s:
+        return None
+    start = s.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == '{':
+            depth += 1
+        elif s[i] == '}':
+            depth -= 1
+            if depth == 0:
                 try:
-                    return json.loads(s[i:j+1])
+                    return json.loads(s[start:i+1])
                 except:
                     return None
     return None
 
-# ---------------- Article extraction (unchanged) ----------------
+def is_boilerplate(title, text):
+    c = (title + " " + (text or "")).lower()
+    patterns = ["upsc current affairs", "instalinks", "covers important current affairs", "gs paper", "content for mains enrichment"]
+    return sum(1 for p in patterns if p in c) >= 2
+
+def is_india_relevant(title, text, url):
+    c = (title + " " + (text or "")).lower()
+    if "india" in c or "indian" in c:
+        return True
+    if any(d in url for d in [".gov.in", "insightsonindia", "drishtiias", "pib.gov.in", "prsindia"]):
+        return True
+    allow = ["nobel", "climate", "un", "summit", "report", "treaty", "agreement", "world bank", "imf"]
+    return any(a in c for a in allow)
+
+# ---------------- Article extraction ----------------
 def extract_article_text_and_image(url, timeout=12):
-    headers={"User-Agent":"Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         from newspaper import Article
-        art=Article(url); art.download(); art.parse()
+        art = Article(url)
+        art.download(); art.parse()
         text = clean_text(art.text or "")
-        top_image = getattr(art,"top_image",None)
-        img_bytes=None
+        top_image = getattr(art, "top_image", None)
+        img_bytes = None
         if top_image:
             try:
-                r=requests.get(top_image, timeout=timeout, headers=headers)
-                if r.status_code==200 and 'image' in r.headers.get('Content-Type',''):
-                    img_bytes=r.content
-            except: img_bytes=None
-        if text and len(text.split())>50: return text, img_bytes
+                r = requests.get(top_image, timeout=timeout, headers=headers)
+                if r.status_code == 200 and 'image' in r.headers.get('Content-Type', ''):
+                    img_bytes = r.content
+            except:
+                img_bytes = None
+        if text and len(text.split()) > 50:
+            return text, img_bytes
     except Exception:
         pass
+    # readability fallback
     try:
-        r=requests.get(url, timeout=timeout, headers=headers)
+        r = requests.get(url, timeout=timeout, headers=headers)
         from readability import Document
         doc = Document(r.text)
         summary_html = doc.summary()
-        text = clean_text(re.sub(r'<[^>]+>',' ', summary_html))
-        img_bytes=None
+        text = clean_text(re.sub(r'<[^>]+>', ' ', summary_html))
+        img_bytes = None
         m = re.search(r'property=["\']og:image["\'] content=["\']([^"\']+)["\']', r.text, flags=re.I)
         if m:
             try:
-                r2=requests.get(m.group(1), timeout=timeout, headers=headers)
-                if r2.status_code==200 and 'image' in r2.headers.get('Content-Type',''):
-                    img_bytes=r2.content
-            except: img_bytes=None
-        if text and len(text.split())>50: return text, img_bytes
+                r2 = requests.get(m.group(1), timeout=timeout, headers=headers)
+                if r2.status_code == 200 and 'image' in r2.headers.get('Content-Type', ''):
+                    img_bytes = r2.content
+            except:
+                img_bytes = None
+        if text and len(text.split()) > 50:
+            return text, img_bytes
     except Exception:
         pass
+    # html strip fallback
     try:
-        r=requests.get(url, timeout=timeout, headers=headers)
-        html=re.sub(r'(?is)<(script|style).*?>.*?(</\1>)',' ', r.text)
-        stripped = re.sub(r'<[^>]+>',' ', html)
+        r = requests.get(url, timeout=timeout, headers=headers)
+        html = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', ' ', r.text)
+        stripped = re.sub(r'<[^>]+>', ' ', html)
         stripped = ' '.join(stripped.split())
         text = clean_text(stripped)
-        if text and len(text.split())>50: return text, None
+        if text and len(text.split()) > 50:
+            return text, None
     except Exception:
         pass
     return "", None
 
-# ---------------- Model + offline summarization (kept as in prior file) ----------------
+# ---------------- Model calls ----------------
 def call_groq(prompt, max_tokens=1200):
-    if not GROQ_API_KEY: return None
+    if not GROQ_API_KEY:
+        return None
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": max_tokens}
     try:
-        url="https://api.groq.com/openai/v1/chat/completions"
-        headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"}
-        payload={"model":GROQ_MODEL,"messages":[{"role":"user","content":prompt}], "temperature":0.0, "max_tokens":max_tokens}
-        r=requests.post(url,json=payload,headers=headers,timeout=60)
-        if r.status_code==200:
+        r = requests.post(url, json=payload, headers=headers, timeout=60)
+        if r.status_code == 200:
             content = r.json()["choices"][0]["message"]["content"]
-            return extract_json_substring(content)
+            parsed = extract_json_substring(content)
+            return parsed
     except Exception as e:
         print("Groq error:", e)
     return None
 
 def call_openai(prompt, max_tokens=1200):
-    if not OPENAI_API_KEY: return None
+    if not OPENAI_API_KEY:
+        return None
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.0, "max_tokens": max_tokens}
     try:
-        url="https://api.openai.com/v1/chat/completions"
-        headers={"Authorization":f"Bearer {OPENAI_API_KEY}","Content-Type":"application/json"}
-        payload={"model":OPENAI_MODEL,"messages":[{"role":"user","content":prompt}], "temperature":0.0, "max_tokens":max_tokens}
-        r=requests.post(url,json=payload,headers=headers,timeout=60)
-        if r.status_code==200:
+        r = requests.post(url, json=payload, headers=headers, timeout=60)
+        if r.status_code == 200:
             content = r.json()["choices"][0]["message"]["content"]
-            return extract_json_substring(content)
+            parsed = extract_json_substring(content)
+            return parsed
     except Exception as e:
         print("OpenAI error:", e)
     return None
@@ -178,209 +228,314 @@ def call_openai(prompt, max_tokens=1200):
 def summarize_via_model(title, url, text):
     trimmed = safe_trim(text, max_chars=3600)
     prompt = f"""
-You are an expert UPSC analyst. Return STRICT valid JSON in this format:
-{{"include":"yes/no","category":"GS1/GS2/GS3/GS4/CME/Mapping/FFP","section_heading":"","context":"","about":"","facts_and_policies":[],"policy_points":[],"detailed_brief":"","impact_or_analysis":[],"upsc_relevance":""}}
+You are an expert UPSC analyst. Return STRICT valid JSON only in this format:
+
+{{
+  "include":"yes/no",
+  "category":"GS1/GS2/GS3/GS4/CME/Mapping/FFP",
+  "section_heading":"",
+  "context":"",
+  "about":"",
+  "facts_and_policies": [],
+  "policy_points": [],
+  "detailed_brief":"",
+  "impact_or_analysis": [],
+  "upsc_relevance":""
+}}
+
+Guidelines:
+- Provide 3-6 factual bullets (schemes, ministries, report names, dates, numbers) in 'facts_and_policies'.
+- Provide policy/scheme/act mentions in 'policy_points' or under 'sub_sections'.
+- Provide 'detailed_brief' 120-220 words synthesizing causes, facts and implications for UPSC.
+- If text is truncated, set "context" to "SOURCE_ONLY".
+- Do NOT invent facts.
+
 Title: {title}
 URL: {url}
 Article Text: {trimmed}
 """
-    parsed=None
+    parsed = None
     if GROQ_API_KEY:
         parsed = call_groq(prompt)
-        if parsed: print("[model] Groq parsed (trunc):", str(parsed)[:300])
+        if parsed:
+            print("[model] Groq parsed JSON (truncated):", str(parsed)[:400])
     if parsed is None and OPENAI_API_KEY:
         parsed = call_openai(prompt)
-        if parsed: print("[model] OpenAI parsed (trunc):", str(parsed)[:300])
+        if parsed:
+            print("[model] OpenAI parsed JSON (truncated):", str(parsed)[:400])
     return parsed
 
-# Offline extractors (shortened versions)
-FACT_PATTERNS = [r'\b\d{4}\b', r'\b\d+%|\d+\.\d+%', r'\b(Ministry|Scheme|Policy|Act|Report|NITI Aayog)\b']
-def split_sentences(text): return [s.strip() for s in re.split(r'(?<=[\.\?\!])\s+', text) if s.strip()]
-def make_context(text):
-    s=split_sentences(text); return " ".join(s[:2]) if s else ""
-def make_about(text):
-    s=split_sentences(text)
-    if len(s)>=4: return " ".join(s[1:4])
-    if len(s)>=2: return " ".join(s[0:2])
-    return text[:400]
-def extract_facts(text, max_b=6):
-    s=split_sentences(text); scored=[]
-    for sent in s:
-        sc=0
-        for pat in FACT_PATTERNS:
-            if re.search(pat, sent, flags=re.I): sc+=1
-        if sc>0: scored.append((sc,sent))
-    scored.sort(key=lambda x:x[0], reverse=True)
-    bullets=[]
-    used=set()
-    for _,sent in scored:
-        b=re.sub(r'\s+',' ',sent)
-        if len(b)>200: b=b[:200].rsplit(' ',1)[0]+'...'
-        if b not in used:
-            bullets.append(b); used.add(b)
-        if len(bullets)>=max_b: break
-    if not bullets:
-        nums=re.findall(r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?%?', text)
-        for n in nums[:max_b]: bullets.append(f"Figure: {n}")
-    return bullets
-def extract_policy_points(text, max_n=4):
-    s=split_sentences(text); pts=[]
-    for sent in s:
-        if re.search(r'\b(Ministry|Department|Scheme|Policy|Act|Bill|NITI Aayog|Prime Minister)\b', sent, flags=re.I):
-            p=re.sub(r'\s+',' ',sent).strip()
-            if len(p)>200: p=p[:200].rsplit(' ',1)[0]+'...'
-            if p not in pts: pts.append(p)
-        if len(pts)>=max_n: break
-    return pts
-def make_detailed_brief(title, about, facts, policies):
-    parts=[about]+facts[:3]+(policies[:1] if policies else [])
-    para=" ".join([p for p in parts if p])
-    if len(para)<120: para = para + " " + " ".join(facts[3:5]) if len(facts)>3 else para
-    return para[:1200]
-def make_impact(text):
-    s=split_sentences(text); im=[]
-    for sent in s:
-        if len(sent)>60 and any(w in sent.lower() for w in ["impact","concern","affect","challenge","benefit","important"]):
-            im.append(sent if len(sent)<200 else sent[:200]+"...")
-        if len(im)>=4: break
-    if not im: im=["Significance for policy and governance.","Potential implications for stakeholders and implementation."]
-    return im
+# -------------- Offline deterministic summarizer --------------
+FACT_PATTERNS = [
+    r'\b\d{4}\b', r'\b\d+%|\d+\.\d+%', r'\b\d{1,3}(?:,\d{3})+\b',
+    r'\b(ICMR|ISRO|NITI Aayog|WHO|World Bank|UN|KAUST|IMF)\b',
+    r'\b(Ministry of|Department of|Scheme|Policy|Act|Bill|Programme|Program)\b',
+    r'\b(report|index|survey)\b'
+]
 
-# ---------------- Web enrichment (if keys present) ----------------
-def serpapi_search(q,num=3):
-    if not SERPAPI_KEY: return []
+def extract_sentences(text):
+    sents = [s.strip() for s in re.split(r'(?<=[\.\?\!])\s+', text) if s.strip()]
+    return sents
+
+def make_context(text):
+    sents = extract_sentences(text)
+    if not sents:
+        return ""
+    return " ".join(sents[:2])[:600]
+
+def make_about(text):
+    sents = extract_sentences(text)
+    if len(sents) >= 4:
+        about = " ".join(sents[1:4])
+    elif len(sents) >= 2:
+        about = " ".join(sents[0:2])
+    else:
+        about = text[:400]
+    return about
+
+def extract_facts(text, max_bullets=6):
+    sents = extract_sentences(text)
+    scored = []
+    for s in sents:
+        score = 0
+        for pat in FACT_PATTERNS:
+            if re.search(pat, s, flags=re.I):
+                score += 1
+        if score > 0:
+            scored.append((score, s))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    bullets = []
+    seen = set()
+    for _, s in scored:
+        b = re.sub(r'\s+', ' ', s).strip()
+        if len(b) > 200:
+            b = b[:200].rsplit(' ', 1)[0] + '...'
+        if b not in seen:
+            bullets.append(b)
+            seen.add(b)
+        if len(bullets) >= max_bullets:
+            break
+    if not bullets:
+        nums = re.findall(r'\b\d{1,3}(?:,\d{3})*(?:\.\d+)?%?', text)
+        for n in nums[:max_bullets]:
+            bullets.append(f"Figure: {n}")
+    return bullets
+
+def extract_policy_points(text, max_items=4):
+    sents = extract_sentences(text)
+    pts = []
+    for s in sents:
+        if re.search(r'\b(Ministry|Department|Policy|Scheme|Act|Bill|NITI Aayog|Prime Minister|PM)\b', s, flags=re.I):
+            p = re.sub(r'\s+', ' ', s).strip()
+            if len(p) > 200:
+                p = p[:200].rsplit(' ', 1)[0] + '...'
+            if p not in pts:
+                pts.append(p)
+        if len(pts) >= max_items:
+            break
+    return pts
+
+def make_detailed_brief(title, about, facts, policy_points):
+    parts = []
+    if about:
+        parts.append(about)
+    parts.extend(facts[:3])
+    if policy_points:
+        parts.append(policy_points[0])
+    para = " ".join(parts)
+    if len(para) < 120:
+        para = para + " " + (" ".join(facts[3:5])) if len(facts) > 3 else para
+    return para[:1200]
+
+def make_impact(text):
+    sents = extract_sentences(text)
+    impacts = []
+    for s in sents:
+        if len(s) > 60 and any(w in s.lower() for w in ["impact", "challenge", "concern", "affect", "threat", "benefit", "important", "key"]):
+            impacts.append(s if len(s) < 200 else s[:200] + "...")
+        if len(impacts) >= 4:
+            break
+    if not impacts:
+        impacts = [
+            "Significance for policy and governance.",
+            "Potential implications for stakeholders and implementation."
+        ]
+    return impacts
+
+# ---------------- Web enrichment ----------------
+def serpapi_search(query, num=3):
+    if not SERPAPI_KEY:
+        return []
+    url = "https://serpapi.com/search.json"
+    params = {"q": query, "api_key": SERPAPI_KEY, "num": num}
     try:
-        r=requests.get("https://serpapi.com/search.json", params={"q":q,"api_key":SERPAPI_KEY,"num":num}, timeout=12)
-        if r.status_code==200:
-            js=r.json()
-            res=[]
-            for it in js.get("organic_results",[])[:num]:
-                res.append({"title":it.get("title"), "link": it.get("link"), "snippet": it.get("snippet")})
-            return res
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code == 200:
+            js = r.json()
+            results = []
+            for item in js.get("organic_results", [])[:num]:
+                results.append({"title": item.get("title"), "link": item.get("link"), "snippet": item.get("snippet")})
+            return results
     except Exception as e:
         print("SerpAPI error:", e)
     return []
-def bing_search(q,num=3):
-    if not BING_API_KEY: return []
+
+def bing_search(query, num=3):
+    if not BING_API_KEY:
+        return []
+    url = "https://api.bing.microsoft.com/v7.0/search"
+    headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
+    params = {"q": query, "count": num, "textDecorations": False, "textFormat": "Raw"}
     try:
-        r=requests.get("https://api.bing.microsoft.com/v7.0/search", headers={"Ocp-Apim-Subscription-Key":BING_API_KEY}, params={"q":q,"count":num}, timeout=12)
-        if r.status_code==200:
-            js=r.json(); res=[]
-            for it in js.get("webPages", {}).get("value", [])[:num]:
-                res.append({"title":it.get("name"), "link":it.get("url"), "snippet":it.get("snippet")})
-            return res
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        if r.status_code == 200:
+            js = r.json()
+            results = []
+            for item in js.get("webPages", {}).get("value", [])[:num]:
+                results.append({"title": item.get("name"), "link": item.get("url"), "snippet": item.get("snippet")})
+            return results
     except Exception as e:
-        print("Bing error:", e)
+        print("Bing search error:", e)
     return []
 
-def fetch_text_for_url(url):
-    headers={"User-Agent":"Mozilla/5.0"}
+def fetch_and_extract_plain_text(url, timeout=12):
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r=requests.get(url, timeout=12, headers=headers)
-        if r.status_code!=200: return ""
+        r = requests.get(url, timeout=timeout, headers=headers)
+        if r.status_code != 200:
+            return ""
         from readability import Document
-        doc=Document(r.text)
-        summary=doc.summary()
-        txt=re.sub(r'<[^>]+>',' ', summary)
-        return clean_text(txt)
+        doc = Document(r.text)
+        summary = doc.summary()
+        text = re.sub(r'<[^>]+>', ' ', summary)
+        text = clean_text(text)
+        if len(text) < 100:
+            stripped = re.sub(r'<[^>]+>', ' ', r.text)
+            text = clean_text(stripped)
+        return text
     except Exception:
         try:
-            r=requests.get(url, timeout=12)
-            return clean_text(re.sub(r'<[^>]+>',' ', r.text))
+            r = requests.get(url, timeout=timeout, headers=headers)
+            stripped = re.sub(r'<[^>]+>', ' ', r.text)
+            return clean_text(stripped)
         except:
             return ""
 
-def web_enrich(title, text):
-    q = title
-    if re.search(r'\byojana\b|\bscheme\b|\bpradhan\b|\bmission\b', title, flags=re.I):
-        q = title + " scheme details government website"
-    results = serpapi_search(q, num=3) if SERPAPI_KEY else []
-    if not results and BING_API_KEY:
-        results = bing_search(q, num=3)
-    web_facts=[]; web_policies=[]; sources=[]
+def web_enrich(title, text, max_results=3):
+    query_base = title
+    if re.search(r'\byojana\b|\bscheme\b|\bpradhan\b|\bmission\b|\bprogram\b|\bprogramme\b', title, flags=re.I):
+        query_base = title + " scheme details government official website"
+    results = serpapi_search(query_base, num=max_results) if SERPAPI_KEY else []
+    if not results:
+        results = bing_search(query_base, num=max_results) if BING_API_KEY else []
+    web_facts = []
+    web_policies = []
+    sources = []
     for r in results:
-        url=r.get("link"); sources.append(url)
-        ptext=fetch_text_for_url(url)
-        if not ptext: continue
-        wf = extract_facts(ptext, max_b=6)
-        wp = extract_policy_points(ptext, max_n=6)
-        for f in wf:
-            if f not in web_facts: web_facts.append(f)
-        for p in wp:
-            if p not in web_policies: web_policies.append(p)
+        link = r.get("link")
+        if not link:
+            continue
+        sources.append(link)
+        page_text = fetch_and_extract_plain_text(link)
+        if not page_text:
+            continue
+        facts = extract_facts(page_text, max_bullets=6)
+        policies = extract_policy_points(page_text, max_items=6)
+        for f in facts:
+            if f not in web_facts:
+                web_facts.append(f)
+        for p in policies:
+            if p not in web_policies:
+                web_policies.append(p)
     return {"web_facts": web_facts, "web_policies": web_policies, "sources": sources}
 
-# ---------------- Compose final parsed article (model + offline + web) ----------------
+# ---------------- Process article (model + offline + web) ----------------
 def process_article(title, url, text, img_bytes):
     parsed = summarize_via_model(title, url, text)
     used_model = parsed is not None
-    if not parsed: parsed={}
-    parsed["include"]=str(parsed.get("include","yes"))
-    parsed["section_heading"]=parsed.get("section_heading") or title
-    if not parsed.get("context"): parsed["context"]=make_context(text)
-    if not parsed.get("about"): parsed["about"]=make_about(text)
+    if not parsed:
+        parsed = {}
+
+    parsed["include"] = str(parsed.get("include", "yes"))
+    parsed["section_heading"] = parsed.get("section_heading") or title
+    if not parsed.get("context"):
+        parsed["context"] = make_context(text)
+    if not parsed.get("about"):
+        parsed["about"] = make_about(text)
+
     facts = parsed.get("facts_and_policies") or []
-    if not facts or len([f for f in facts if len(f.strip())>8])<2:
-        facts = facts + extract_facts(text, max_b=6)
-    parsed["facts_and_policies"] = facts[:8]
+    if not facts or len([f for f in facts if len(f.strip()) > 8]) < 2:
+        offline_facts = extract_facts(text, max_bullets=6)
+        parsed["facts_and_policies"] = (facts + offline_facts)[:8]
+    else:
+        parsed["facts_and_policies"] = facts[:8]
+
     policy_points = parsed.get("policy_points") or []
     if not policy_points:
-        policy_points = extract_policy_points(text, max_n=4)
-    parsed["policy_points"] = policy_points
+        parsed["policy_points"] = extract_policy_points(text, max_items=4)
+
     subs = parsed.get("sub_sections") or []
     if parsed.get("policy_points"):
-        subs.append({"heading":"Key Provisions / Policy Mentions","points": parsed["policy_points"]})
-    parsed["sub_sections"]=subs
-    if not parsed.get("detailed_brief") or len(parsed.get("detailed_brief","").strip())<120:
-        parsed["detailed_brief"]=make_detailed_brief(title, parsed.get("about",""), parsed.get("facts_and_policies",[]), parsed.get("policy_points",[]))
-    if not parsed.get("impact_or_analysis"):
-        parsed["impact_or_analysis"]=make_impact(text)
+        subs.append({"heading": "Key Provisions / Policy Mentions", "points": parsed["policy_points"]})
+    parsed["sub_sections"] = subs
 
-    # category heuristic if not provided
+    if not parsed.get("detailed_brief") or len(parsed.get("detailed_brief", "").strip()) < 120:
+        parsed["detailed_brief"] = make_detailed_brief(title, parsed.get("about", ""), parsed.get("facts_and_policies", []), parsed.get("policy_points", []))
+
+    if not parsed.get("impact_or_analysis"):
+        parsed["impact_or_analysis"] = make_impact(text)
+
     cat = parsed.get("category") or ""
     if cat:
-        m=re.search(r'gs\s*([1-4])', str(cat), flags=re.I)
-        if m: parsed["category"]=f"GS{m.group(1)}"
+        m = re.search(r'gs\s*([1-4])', str(cat), flags=re.I)
+        if m:
+            parsed["category"] = f"GS{m.group(1)}"
     else:
-        ctext=(title+" "+text).lower()
-        if any(k in ctext for k in ["constitution","parliament","supreme court","policy","minister","government"]): parsed["category"]="GS2"
-        elif any(k in ctext for k in ["economy","gdp","rbi","inflation","industry","agriculture","isro","science","environment","climate","nobel"]): parsed["category"]="GS3"
-        elif any(k in ctext for k in ["ethic","ethics","corruption","integrity"]): parsed["category"]="GS4"
-        elif any(k in ctext for k in ["study","report","survey","index","analysis"]): parsed["category"]="CME"
-        else: parsed["category"]="Misc"
+        ctext = (title + " " + text).lower()
+        if any(k in ctext for k in ["constitution", "parliament", "supreme court", "policy", "minister", "government"]):
+            parsed["category"] = "GS2"
+        elif any(k in ctext for k in ["economy", "gdp", "rbi", "inflation", "industry", "agriculture", "isro", "science", "environment", "climate", "nobel"]):
+            parsed["category"] = "GS3"
+        elif any(k in ctext for k in ["ethic", "ethics", "corruption", "integrity"]):
+            parsed["category"] = "GS4"
+        elif any(k in ctext for k in ["study", "report", "survey", "analysis", "index"]):
+            parsed["category"] = "CME"
+        else:
+            parsed["category"] = "Misc"
 
-    # web enrichment trigger: scheme/yojana or insufficient facts/policies
     need_web = False
-    if len(parsed.get("facts_and_policies",[]))<3 or len(parsed.get("policy_points",[]))<1:
+    if len(parsed.get("facts_and_policies", [])) < 3 or len(parsed.get("policy_points", [])) < 1:
         need_web = True
-    if re.search(r'\byojana\b|\bscheme\b|\bpradhan\b|\bmission\b', title, flags=re.I):
+    if re.search(r'\byojana\b|\bscheme\b|\bpradhan\b|\bmission\b|\bprogram\b|\bprogramme\b', title, flags=re.I):
         need_web = True
 
     if need_web and (SERPAPI_KEY or BING_API_KEY):
         try:
-            enr = web_enrich(title, text)
-            wf = enr.get("web_facts",[])[:6]
-            wp = enr.get("web_policies",[])[:6]
-            # merge unique
-            merged_facts = parsed.get("facts_and_policies",[]) + [f for f in wf if f not in parsed.get("facts_and_policies",[])]
-            merged_pols = parsed.get("policy_points",[]) + [p for p in wp if p not in parsed.get("policy_points",[])]
+            enrich = web_enrich(title, text, max_results=4)
+            wf = enrich.get("web_facts", [])[:6]
+            wp = enrich.get("web_policies", [])[:6]
+            merged_facts = parsed.get("facts_and_policies", []) + [f for f in wf if f not in parsed.get("facts_and_policies", [])]
+            merged_policies = parsed.get("policy_points", []) + [p for p in wp if p not in parsed.get("policy_points", [])]
             parsed["facts_and_policies"] = merged_facts[:8]
-            parsed["policy_points"] = merged_pols[:8]
+            parsed["policy_points"] = merged_policies[:8]
             if parsed.get("policy_points"):
-                parsed["sub_sections"].append({"heading":"Key Provisions / Policy Mentions (web-enriched)","points": parsed["policy_points"]})
-            parsed["web_sources"] = enr.get("sources",[])
-            print(" -> web enrichment used; sources:", parsed.get("web_sources",[])[:3])
+                subs = parsed.get("sub_sections", []) or []
+                subs.append({"heading": "Key Provisions / Policy Mentions (web-enriched)", "points": parsed["policy_points"]})
+                parsed["sub_sections"] = subs
+            parsed["web_sources"] = enrich.get("sources", [])
+            print(" -> web enrichment used; sources:", parsed.get("web_sources", [])[:3])
         except Exception as e:
-            print("Web enrichment failure:", e)
+            print("Web enrichment failed:", e)
 
     parsed["image_bytes"] = img_bytes
     parsed.setdefault("upsc_relevance", CATEGORY_LABELS.get(parsed["category"], parsed["category"]))
     parsed.setdefault("source", url)
-    parsed.setdefault("include","yes")
+    parsed.setdefault("include", "yes")
+    parsed.setdefault("sub_sections", parsed.get("sub_sections", []))
     return parsed, used_model
 
-# ---------------- PDF builder — simplified, robust (no fragile tables) ----------------
-def generate_logo_bytes(text="DailyCAThroughAI", size=(420,80), bgcolor=(31,78,121), fg=(255,255,255)):
+# ---------------- PDF helpers & builder (simple, robust) ----------------
+def generate_logo_bytes(text="DailyCAThroughAI", size=(420, 80), bgcolor=(31, 78, 121), fg=(255, 255, 255)):
     try:
         img = PILImage.new("RGB", size, bgcolor)
         draw = ImageDraw.Draw(img)
@@ -389,48 +544,57 @@ def generate_logo_bytes(text="DailyCAThroughAI", size=(420,80), bgcolor=(31,78,1
         except:
             font = ImageFont.load_default()
         try:
-            bbox = draw.textbbox((0,0), text, font=font); w=bbox[2]-bbox[0]; h=bbox[3]-bbox[1]
+            bbox = draw.textbbox((0, 0), text, font=font)
+            w = bbox[2] - bbox[0]; h = bbox[3] - bbox[1]
         except:
-            w,h = draw.textsize(text, font=font)
-        x=(size[0]-w)/2; y=(size[1]-h)/2
-        draw.text((x,y), text, font=font, fill=fg)
-        bio=io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
+            w, h = draw.textsize(text, font=font)
+        x = (size[0] - w) / 2; y = (size[1] - h) / 2
+        draw.text((x, y), text, font=font, fill=fg)
+        bio = io.BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
         return bio.read()
     except Exception as e:
         print("logo error", e); return None
 
 def make_image_element_simple(im_bytes, max_w=180, max_h=120):
-    if not im_bytes: return None
+    if not im_bytes:
+        return None
     try:
         pil = PILImage.open(io.BytesIO(im_bytes)); pil.load()
-        w,h = pil.size
-        if w<=0 or h<=0 or w>6000 or h>6000: return None
-        ratio = min(max_w/float(w), max_h/float(h), 1.0)
-        new_w, new_h = int(w*ratio), int(h*ratio)
-        pil = pil.resize((new_w,new_h), PILImage.LANCZOS)
-        bb=io.BytesIO(); pil.save(bb, format='PNG'); bb.seek(0)
+        w, h = pil.size
+        if w <= 0 or h <= 0 or w > 6000 or h > 6000:
+            return None
+        ratio = min(max_w / float(w), max_h / float(h), 1.0)
+        new_w, new_h = int(w * ratio), int(h * ratio)
+        pil = pil.resize((new_w, new_h), PILImage.LANCZOS)
+        bb = io.BytesIO(); pil.save(bb, format="PNG"); bb.seek(0)
         img = RLImage(bb, width=new_w, height=new_h)
-        img.hAlign='RIGHT'
+        img.hAlign = 'RIGHT'
         return img
     except Exception as e:
         print("make_image_element_simple skipped image:", e)
         return None
 
 def split_into_paragraphs(text, chunk=800):
+    if not text:
+        return []
     text = text.strip()
-    if not text: return []
     if len(text) <= chunk:
         return [text]
     parts = []
     start = 0
-    while start < len(text):
+    L = len(text)
+    while start < L:
         end = start + chunk
-        # avoid cutting words
-        if end < len(text):
-            end = text.rfind(' ', start, end)
-            if end <= start: end = start + chunk
+        if end < L:
+            # try to break at sentence end or space
+            next_break = text.rfind('.', start, end)
+            if next_break <= start:
+                next_break = text.rfind(' ', start, end)
+            if next_break <= start:
+                next_break = end
+            end = next_break
         parts.append(text[start:end].strip())
-        start = end
+        start = end if end > start else start + chunk
     return parts
 
 def build_pdf_simple(articles, out_path):
@@ -441,102 +605,88 @@ def build_pdf_simple(articles, out_path):
     styles.add(ParagraphStyle(name="Section", fontSize=12, leading=14, textColor=colors.HexColor("#1f4e79")))
     styles.add(ParagraphStyle(name="SmallGray", fontSize=8, leading=10, textColor=colors.grey))
 
-    story=[]
-    # header
+    story = []
     today = datetime.datetime.now().strftime("%d %B %Y")
     logo = generate_logo_bytes()
     if logo:
         img = RLImage(io.BytesIO(logo), width=120, height=32)
-        img.hAlign='LEFT'
+        img.hAlign = 'LEFT'
         story.append(img)
     story.append(Paragraph(f"<b>UPSC CURRENT AFFAIRS</b> — {today}", styles["Title"]))
-    story.append(Spacer(1,8))
+    story.append(Spacer(1, 8))
 
-    # group by category
-    order = ["GS1","GS2","GS3","GS4","CME","FFP","Mapping","Misc"]
-    grouped={k:[] for k in order}
+    order = ["GS1", "GS2", "GS3", "GS4", "CME", "FFP", "Mapping", "Misc"]
+    grouped = {k: [] for k in order}
     for a in articles:
-        cat=a.get("category","Misc")
-        grouped.setdefault(cat,[]).append(a)
+        cat = a.get("category", "Misc")
+        grouped.setdefault(cat, []).append(a)
 
     for cat in order:
-        items = grouped.get(cat,[])
-        if not items: continue
-        story.append(Paragraph(CATEGORY_LABELS.get(cat,cat), styles["Section"]))
-        story.append(Spacer(1,6))
+        items = grouped.get(cat, [])
+        if not items:
+            continue
+        story.append(Paragraph(CATEGORY_LABELS.get(cat, cat), styles["Section"]))
+        story.append(Spacer(1, 6))
         for it in items:
-            # card border using HR + background-like approach (simple)
-            # Title
             story.append(Paragraph(f"<b>{it.get('section_heading','Untitled')}</b>", styles["Title"]))
-            # small meta line
             meta = f"{it.get('upsc_relevance','')} • Source: {it.get('source','')}"
             story.append(Paragraph(meta, styles["SmallGray"]))
-            story.append(Spacer(1,4))
+            story.append(Spacer(1, 4))
 
-            # image (right-aligned) placed before textual contents so it displays near top
             img_elem = None
             if it.get("image_bytes"):
                 img_elem = make_image_element_simple(it.get("image_bytes"))
             if img_elem:
                 story.append(img_elem)
-                story.append(Spacer(1,4))
+                story.append(Spacer(1, 4))
 
-            # Context & About
             if it.get("context"):
-                for p in split_into_paragraphs(it.get("context",""), chunk=800):
+                for p in split_into_paragraphs(it.get("context", ""), chunk=800):
                     story.append(Paragraph(f"<b>Context:</b> {p}", styles["Body"]))
             if it.get("about"):
-                for p in split_into_paragraphs(it.get("about",""), chunk=800):
+                for p in split_into_paragraphs(it.get("about", ""), chunk=800):
                     story.append(Paragraph(f"<b>About:</b> {p}", styles["Body"]))
 
-            # Facts & Data
-            facts = it.get("facts_and_policies",[]) or []
+            facts = it.get("facts_and_policies", []) or []
             if facts:
                 story.append(Paragraph("<b>Facts & Data:</b>", styles["Body"]))
                 bullets = [ListItem(Paragraph(f, styles["Body"])) for f in facts]
                 story.append(ListFlowable(bullets, bulletType='bullet', leftIndent=12))
 
-            # Policy / Subsections
-            subs = it.get("sub_sections",[]) or []
+            subs = it.get("sub_sections", []) or []
             for s in subs:
-                head = s.get("heading","")
-                pts = s.get("points",[]) or []
+                head = s.get("heading", ""); pts = s.get("points", []) or []
                 if head:
                     story.append(Paragraph(f"<b>{head}:</b>", styles["Body"]))
                 if pts:
                     bullets = [ListItem(Paragraph(p, styles["Body"])) for p in pts]
                     story.append(ListFlowable(bullets, bulletType='bullet', leftIndent=12))
 
-            # Detailed brief
             if it.get("detailed_brief"):
                 story.append(Paragraph("<b>Detailed Brief:</b>", styles["Body"]))
-                for p in split_into_paragraphs(it.get("detailed_brief",""), chunk=800):
+                for p in split_into_paragraphs(it.get("detailed_brief", ""), chunk=800):
                     story.append(Paragraph(p, styles["Body"]))
 
-            # Impact
-            impact = it.get("impact_or_analysis",[]) or []
+            impact = it.get("impact_or_analysis", []) or []
             if impact:
                 story.append(Paragraph("<b>Impact / Analysis:</b>", styles["Body"]))
                 bullets = [ListItem(Paragraph(p, styles["Body"])) for p in impact]
                 story.append(ListFlowable(bullets, bulletType='bullet', leftIndent=12))
 
-            # end card with thin separator
-            story.append(Spacer(1,8))
+            story.append(Spacer(1, 8))
             hr = HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cfdff0"))
             story.append(hr)
-            story.append(Spacer(1,8))
+            story.append(Spacer(1, 8))
 
-    # footer
     story.append(Paragraph("Note: Auto-generated summaries; verify facts from original sources if needed.", ParagraphStyle(name="note", fontSize=8, textColor=colors.grey)))
-
     try:
         doc.build(story)
-        return out_path if (out_path:=out_path) else out_path
+        return out_path
     except Exception as e:
-        print("PDF build failed (final fallback):", e)
+        print("PDF build failed:", e)
         return None
 
-# ---------------- Email (unchanged) ----------------
+# ---------------- Email ----------------
 def email_pdf_file(path):
     if not SMTP_USER or not SMTP_PASSWORD or not EMAIL_TO:
         raise EnvironmentError("Set SMTP_USER / SMTP_PASSWORD / EMAIL_TO env variables")
@@ -549,75 +699,84 @@ def email_pdf_file(path):
         msg.add_attachment(f.read(), maintype="application", subtype="pdf", filename=os.path.basename(path))
     ctx = ssl.create_default_context()
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-        s.starttls(context=ctx); s.login(SMTP_USER, SMTP_PASSWORD); s.send_message(msg)
+        s.starttls(context=ctx)
+        s.login(SMTP_USER, SMTP_PASSWORD)
+        s.send_message(msg)
     print("Email sent to", EMAIL_TO)
 
-# ---------------- Main (assemble pipeline) ----------------
-def process_and_run(test_url=None):
+# ---------------- Main ----------------
+def main(test_url=None):
     date_str = datetime.date.today().isoformat()
-    out_pdf = PDF_FILENAME_TEMPLATE.format(date=(date_str if not test_url else "TEST"))
-    candidates=[]
+    output_pdf = PDF_FILENAME_TEMPLATE.format(date=(date_str if not test_url else "TEST"))
+    candidates = []
+
     if test_url:
-        candidates.append({"title":"Test article", "link": test_url})
+        candidates.append({"title": "Test article", "link": test_url})
     else:
         for feed in RSS_FEEDS:
             try:
-                f = feedparser.parse(feed)
-                for e in f.entries[:12]:
-                    title = e.get("title",""); link = e.get("link","")
-                    if title and link: candidates.append({"title":title,"link":link})
-                    if len(candidates) >= MAX_CANDIDATES: break
+                parsed = feedparser.parse(feed)
+                for entry in parsed.entries[:12]:
+                    title = entry.get("title", "")
+                    link = entry.get("link", "")
+                    if title and link:
+                        candidates.append({"title": title, "link": link})
+                    if len(candidates) >= MAX_CANDIDATES:
+                        break
             except Exception as ex:
                 print("Feed error", feed, ex)
     print("Candidates:", len(candidates))
 
-    processed=[]
-    included=0; seen=set()
+    processed = []
+    included = 0
+    seen = set()
     for c in candidates:
-        if included >= MAX_INCLUSIONS: break
-        title=c["title"].strip(); link=c["link"]
-        if link in seen: continue
+        if included >= MAX_INCLUSIONS:
+            break
+        title = c["title"].strip()
+        link = c["link"]
+        if link in seen:
+            continue
         seen.add(link)
         print("Processing:", title)
-        text,img = extract_article_text_and_image(link)
+        text, img = extract_article_text_and_image(link)
         if not text:
             print(" -> no text, skip"); continue
         if is_boilerplate(title, text):
-            print(" -> boilerplate skip"); continue
-        # basic India relevance check
-        if not (("india" in (title+" "+text).lower()) or any(d in link for d in [".gov.in","insightsonindia","drishtiias","pib.gov.in","prsindia"])):
-            print(" -> not India-relevant (skipping)"); continue
+            print(" -> boilerplate skipped"); continue
+        if not is_india_relevant(title, text, link):
+            print(" -> not India-relevant skip"); continue
 
         parsed, used_model = process_article(title, link, text, img)
-        if str(parsed.get("include","yes")).lower() != "yes":
-            print(" -> marked not relevant by model, skipping"); continue
+        if str(parsed.get("include", "yes")).lower() != "yes":
+            print(" -> model marked not relevant; skipping")
+            continue
 
-        print(" -> included as", parsed.get("category"), "model_used=", used_model)
+        print(f" -> included: category={parsed.get('category')} (model_used={used_model})")
         processed.append(parsed)
         included += 1
-        time.sleep(0.5)
+        time.sleep(0.6)
 
     if not processed:
         print("No relevant items found. Exiting.")
         return
 
-    pdf_path = build_pdf_simple(processed, out_pdf)
+    pdf_path = build_pdf_simple(processed, output_pdf)
     if not pdf_path:
-        print("PDF creation failed.")
+        print("PDF generation failed.")
         return
     print("PDF created:", pdf_path)
 
     if test_url:
-        print("Test mode: not emailing. Inspect", pdf_path)
+        print("Test mode — not emailing. Inspect", pdf_path)
     else:
         try:
             email_pdf_file(pdf_path)
         except Exception as e:
             print("Email failed:", e)
 
-# ---------------- CLI ----------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test-url", help="Generate TEST PDF from a single URL", default=None)
+    parser.add_argument("--test-url", help="Run script for a single test URL and produce TEST PDF", default=None)
     args = parser.parse_args()
-    process_and_run(test_url=args.test_url)
+    main(test_url=args.test_url)
